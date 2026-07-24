@@ -34,6 +34,7 @@ Options:
 | `--settings` | `~/.config/zed/settings.json` | Zed settings file to update |
 | `--write` | off | Modify the file (default is dry-run to stdout) |
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
+| `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model) |
 | `--reasoning-effort` | `medium` | Effort assigned to models with `supports_reasoning` |
 
 ## Field mapping
@@ -48,9 +49,18 @@ Options:
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
 | `supports_prompt_caching` (default false) | `capabilities.prompt_cache_key` |
 | `supports_reasoning` | `reasoning_effort` (value from `--reasoning-effort`) |
+| `interleaved_reasoning` (probed) | `capabilities.interleaved_reasoning` — only when `--probe` confirms the model both accepts and emits `reasoning_content` |
 
 Non-chat models (`mode` of `embedding`, `image_generation`, ...) are skipped,
 and duplicate deployments of the same `model_name` are collapsed.
+
+`interleaved_reasoning` defaults to `false` because LiteLLM's `/model/info`
+cannot report it. Pass `--probe` to send a minimal test request to each
+reasoning-capable model: it sets `interleaved_reasoning: true` only when the
+model both accepts `reasoning_content` in input *and* emits it in its own
+response — distinguishing real support from silent accept-and-ignore. The
+probe adds one near-zero-cost chat-completions call (`max_tokens: 1`) per
+reasoning model, so it's opt-in.
 
 ## Notes
 

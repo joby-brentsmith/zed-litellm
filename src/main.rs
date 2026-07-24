@@ -49,6 +49,14 @@ struct Args {
     #[arg(long)]
     replace: bool,
 
+    /// Probe each reasoning-capable model by sending a minimal chat-completions
+    /// request with `reasoning_content` on a prior assistant turn. Sets
+    /// `capabilities.interleaved_reasoning` to true only when the model both
+    /// accepts the field and emits `reasoning_content` in its own response —
+    /// distinguishing real support from silent accept-and-ignore.
+    #[arg(long)]
+    probe: bool,
+
     /// reasoning_effort assigned to models that report supports_reasoning
     #[arg(long, default_value = "medium")]
     reasoning_effort: String,
@@ -92,7 +100,13 @@ fn main() -> Result<()> {
     let api_url = format!("{base_url}/v1");
 
     let entries = fetch_model_info(&base_url, args.api_key.as_deref())?;
-    let discovered = to_zed_models(&entries, &args.reasoning_effort);
+    let interleaved = if args.probe {
+        eprintln!("Probing reasoning models for interleaved_reasoning support...");
+        probe_interleaved_reasoning(&api_url, &entries, args.api_key.as_deref())
+    } else {
+        Vec::new()
+    };
+    let discovered = to_zed_models(&entries, &interleaved, &args.reasoning_effort);
     if discovered.is_empty() {
         bail!("no chat models returned by {base_url}/model/info");
     }
@@ -169,11 +183,115 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
     Ok(parsed.data)
 }
 
+/// Probes reasoning-capable models for `interleaved_reasoning` support by
+/// sending a minimal chat-completions request with `reasoning_content` set on
+/// a prior assistant turn. A model is reported as supporting interleaved
+/// reasoning only when it (a) returns 200 (accepts the field) and (b) emits
+/// `reasoning_content` in its own response message (uses the field) — this
+/// distinguishes real support from silent accept-and-ignore.
+///
+/// Failures (network errors, parse errors, non-200) for a given model are
+/// logged and the model is reported as not supporting interleaved reasoning;
+/// other models are still probed.
+fn probe_interleaved_reasoning(
+    api_url: &str,
+    entries: &[ModelEntry],
+    api_key: Option<&str>,
+) -> Vec<String> {
+    let mut supported = Vec::new();
+    let candidates: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| {
+            let info = entry.model_info.as_ref()?;
+            if info.supports_reasoning == Some(true) {
+                entry.model_name.as_deref()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for model_name in candidates {
+        match probe_one_model(api_url, model_name, api_key) {
+            Ok(true) => {
+                eprintln!("  {model_name}: interleaved_reasoning supported");
+                supported.push(model_name.to_string());
+            }
+            Ok(false) => {
+                eprintln!("  {model_name}: no (accepts but does not emit reasoning_content)");
+            }
+            Err(error) => {
+                eprintln!("  {model_name}: probe failed ({error:#}) — leaving off");
+            }
+        }
+    }
+    supported
+}
+
+fn probe_one_model(api_url: &str, model_name: &str, api_key: Option<&str>) -> Result<bool> {
+    let url = format!("{api_url}/chat/completions");
+    // `reasoning_effort: medium` to actually trigger a reasoning turn;
+    // `max_tokens: 1` to keep cost near zero. We only need a response
+    // message shape, not real output.
+    let payload = json!({
+        "model": model_name,
+        "max_tokens": 1,
+        "reasoning_effort": "medium",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "reasoning_content": "prior thinking", "content": "ok"},
+            {"role": "user", "content": "hi again"},
+        ],
+    });
+    let body = serde_json::to_string(&payload)?;
+
+    let mut request = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json");
+    if let Some(api_key) = api_key {
+        request = request.set("Authorization", &format!("Bearer {api_key}"));
+    }
+    let response = request
+        .send_string(&body)
+        .with_context(|| format!("probing {model_name} at {url}"))?;
+
+    let parsed: ProbeResponse = response.into_json().context("parsing probe response")?;
+    let message = parsed
+        .choices
+        .first()
+        .and_then(|choice| choice.message.as_ref())
+        .ok_or_else(|| anyhow!("probe response had no message"))?;
+    // The real signal: the model emitted reasoning_content of its own.
+    // A server that silently drops the input field would not generate this.
+    Ok(message.reasoning_content.is_some())
+}
+
+#[derive(Deserialize)]
+struct ProbeResponse {
+    choices: Vec<ProbeChoice>,
+}
+
+#[derive(Deserialize)]
+struct ProbeChoice {
+    message: Option<ProbeMessage>,
+}
+
+#[derive(Deserialize)]
+struct ProbeMessage {
+    reasoning_content: Option<serde_json::Value>,
+}
+
 /// Maps LiteLLM `/model/info` entries to Zed `openai_compatible`
 /// `available_models` values. Non-chat models (embeddings, image generation,
 /// ...) are skipped, and duplicate deployments of the same model name are
-/// collapsed into one entry.
-fn to_zed_models(entries: &[ModelEntry], reasoning_effort: &str) -> Vec<Value> {
+/// collapsed into one entry. `interleaved` lists model names that have been
+/// verified (via probe) to both accept `reasoning_content` in input and emit
+/// it in output — those get `interleaved_reasoning: true`.
+fn to_zed_models(
+    entries: &[ModelEntry],
+    interleaved: &[String],
+    reasoning_effort: &str,
+) -> Vec<Value> {
     let mut by_name = std::collections::BTreeMap::new();
 
     for entry in entries {
@@ -192,6 +310,9 @@ fn to_zed_models(entries: &[ModelEntry], reasoning_effort: &str) -> Vec<Value> {
         }
 
         let info = info.cloned().unwrap_or_default();
+        let interleaved_support = interleaved
+            .iter()
+            .any(|name| Some(name.as_str()) == entry.model_name.as_deref());
         let mut model = serde_json::Map::new();
         model.insert("name".into(), json!(name));
 
@@ -229,6 +350,12 @@ fn to_zed_models(entries: &[ModelEntry], reasoning_effort: &str) -> Vec<Value> {
                 // is present. LiteLLM reports `supports_prompt_caching`, so map
                 // it directly rather than guessing `false`.
                 "prompt_cache_key": info.supports_prompt_caching.unwrap_or(false),
+                // True only when verified by --probe: the model accepts
+                // `reasoning_content` in input AND emits it in output. Defaults
+                // to false because LiteLLM's /model/info cannot report this and
+                // a blind `true` degrades multi-turn reasoning on endpoints
+                // that silently ignore the field.
+                "interleaved_reasoning": interleaved_support,
             }),
         );
 
@@ -378,7 +505,7 @@ mod tests {
             },
         )];
 
-        let models = to_zed_models(&entries, "medium");
+        let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(
             models,
             vec![json!({
@@ -390,6 +517,7 @@ mod tests {
                     "images": true,
                     "parallel_tool_calls": true,
                     "prompt_cache_key": true,
+                    "interleaved_reasoning": false,
                 }
             })]
         );
@@ -404,7 +532,7 @@ mod tests {
     fn generated_capabilities_include_all_zed_required_fields() {
         let entries = vec![entry("mystery-model", ModelInfo::default())];
 
-        let caps = &to_zed_models(&entries, "medium")[0]["capabilities"];
+        let caps = &to_zed_models(&entries, &[], "medium")[0]["capabilities"];
         assert!(caps.get("tools").is_some(), "missing tools");
         assert!(caps.get("images").is_some(), "missing images");
         assert!(
@@ -415,11 +543,16 @@ mod tests {
             caps.get("prompt_cache_key").is_some(),
             "missing prompt_cache_key"
         );
+        assert!(
+            caps.get("interleaved_reasoning").is_some(),
+            "missing interleaved_reasoning"
+        );
         // A model with no reported capabilities should still get safe defaults.
         assert_eq!(caps["tools"], json!(true));
         assert_eq!(caps["images"], json!(false));
         assert_eq!(caps["parallel_tool_calls"], json!(false));
         assert_eq!(caps["prompt_cache_key"], json!(false));
+        assert_eq!(caps["interleaved_reasoning"], json!(false));
     }
 
     #[test]
@@ -436,7 +569,7 @@ mod tests {
             entry("gpt-4o", ModelInfo::default()),
         ];
 
-        let models = to_zed_models(&entries, "medium");
+        let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0]["name"], "gpt-4o");
     }
@@ -451,7 +584,7 @@ mod tests {
             },
         )];
 
-        let models = to_zed_models(&entries, "high");
+        let models = to_zed_models(&entries, &[], "high");
         assert_eq!(models[0]["reasoning_effort"], "high");
     }
 
@@ -472,7 +605,7 @@ mod tests {
                 ..Default::default()
             },
         )];
-        let models = to_zed_models(&entries, "medium");
+        let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], json!(1048576));
         assert_eq!(
             models[0].get("max_output_tokens"),
@@ -489,16 +622,41 @@ mod tests {
                 ..Default::default()
             },
         )];
-        let models = to_zed_models(&entries, "medium");
+        let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], json!(200000));
         assert_eq!(models[0]["max_output_tokens"], json!(8192));
+    }
+
+    #[test]
+    fn interleaved_reasoning_set_only_for_probed_models() {
+        let entries = vec![entry(
+            "glm-5.2",
+            ModelInfo {
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+
+        // Without probe results: defaults to false.
+        let models = to_zed_models(&entries, &[], "medium");
+        assert_eq!(
+            models[0]["capabilities"]["interleaved_reasoning"],
+            json!(false)
+        );
+
+        // With this model in the probe-supported list: set to true.
+        let models = to_zed_models(&entries, &["glm-5.2".to_string()], "medium");
+        assert_eq!(
+            models[0]["capabilities"]["interleaved_reasoning"],
+            json!(true)
+        );
     }
 
     #[test]
     fn missing_token_counts_fall_back_to_default() {
         let entries = vec![entry("mystery-model", ModelInfo::default())];
 
-        let models = to_zed_models(&entries, "medium");
+        let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(models[0].get("max_output_tokens"), None);
     }
