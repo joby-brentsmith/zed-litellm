@@ -26,7 +26,7 @@ struct Args {
     url: String,
 
     /// API key for the proxy; must be allowed to call /model/info
-    #[arg(long, env = "LITELLM_ADMIN_KEY", hide_env_values = true)]
+    #[arg(long, env = "LITELLM_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
     /// Provider id to write under language_models.openai_compatible
