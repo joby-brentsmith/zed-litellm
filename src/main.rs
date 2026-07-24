@@ -313,6 +313,7 @@ fn to_zed_models(
         let interleaved_support = interleaved
             .iter()
             .any(|name| Some(name.as_str()) == entry.model_name.as_deref());
+        let is_responses_mode = mode == Some("responses");
         let mut model = serde_json::Map::new();
         model.insert("name".into(), json!(name));
 
@@ -340,24 +341,39 @@ fn to_zed_models(
         if info.supports_reasoning == Some(true) {
             model.insert("reasoning_effort".into(), json!(reasoning_effort));
         }
-        model.insert(
-            "capabilities".into(),
-            json!({
-                "tools": info.supports_function_calling.unwrap_or(true),
-                "images": info.supports_vision.unwrap_or(false),
-                "parallel_tool_calls": info.supports_parallel_function_calling.unwrap_or(false),
-                // Required by Zed's capabilities schema whenever `capabilities`
-                // is present. LiteLLM reports `supports_prompt_caching`, so map
-                // it directly rather than guessing `false`.
-                "prompt_cache_key": info.supports_prompt_caching.unwrap_or(false),
-                // True only when verified by --probe: the model accepts
-                // `reasoning_content` in input AND emits it in output. Defaults
-                // to false because LiteLLM's /model/info cannot report this and
-                // a blind `true` degrades multi-turn reasoning on endpoints
-                // that silently ignore the field.
-                "interleaved_reasoning": interleaved_support,
-            }),
+        let mut caps = serde_json::Map::new();
+        caps.insert(
+            "tools".into(),
+            json!(info.supports_function_calling.unwrap_or(true)),
         );
+        caps.insert(
+            "images".into(),
+            json!(info.supports_vision.unwrap_or(false)),
+        );
+        caps.insert(
+            "parallel_tool_calls".into(),
+            json!(info.supports_parallel_function_calling.unwrap_or(false)),
+        );
+        // Required by Zed's capabilities schema whenever `capabilities`
+        // is present. LiteLLM reports `supports_prompt_caching`, so map
+        // it directly rather than guessing `false`.
+        caps.insert(
+            "prompt_cache_key".into(),
+            json!(info.supports_prompt_caching.unwrap_or(false)),
+        );
+        // True only when verified by --probe: the model accepts
+        // `reasoning_content` in input AND emits it in output. Defaults
+        // to false because LiteLLM's /model/info cannot report this and
+        // a blind `true` degrades multi-turn reasoning on endpoints
+        // that silently ignore the field.
+        caps.insert("interleaved_reasoning".into(), json!(interleaved_support));
+        // A `responses`-mode model only works with the Responses API.
+        // Zed defaults `chat_completions` to true, so we must explicitly
+        // set it to false to avoid routing to /chat/completions.
+        if is_responses_mode {
+            caps.insert("chat_completions".into(), json!(false));
+        }
+        model.insert("capabilities".into(), Value::Object(caps));
 
         by_name.insert(name.to_string(), Value::Object(model));
     }
@@ -625,6 +641,66 @@ mod tests {
         let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], json!(200000));
         assert_eq!(models[0]["max_output_tokens"], json!(8192));
+    }
+
+    #[test]
+    fn responses_mode_model_gets_chat_completions_false() {
+        let entries = vec![entry(
+            "o3-only-responses",
+            ModelInfo {
+                mode: Some("responses".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        let models = to_zed_models(&entries, &[], "medium");
+        assert_eq!(
+            models[0]["capabilities"]["chat_completions"],
+            json!(false),
+            "responses-mode model must have chat_completions: false"
+        );
+    }
+
+    #[test]
+    fn chat_mode_model_omits_chat_completions() {
+        // chat-completions defaults to true in Zed, so we omit it for
+        // chat-mode models to avoid cluttering the settings.
+        let entries = vec![entry(
+            "gpt-4o",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        let models = to_zed_models(&entries, &[], "medium");
+        assert!(
+            models[0]["capabilities"].get("chat_completions").is_none(),
+            "chat-mode model should not set chat_completions (Zed defaults to true)"
+        );
+    }
+
+    #[test]
+    fn probe_response_detects_reasoning_content_presence() {
+        // With reasoning_content in the response: model emits thinking.
+        let with_reasoning = r#"{"choices":[{"message":{"reasoning_content":"thinking..."}}]}"#;
+        let parsed: ProbeResponse = serde_json::from_str(with_reasoning).unwrap();
+        let has_reasoning = parsed
+            .choices
+            .first()
+            .and_then(|c| c.message.as_ref())
+            .is_some_and(|m| m.reasoning_content.is_some());
+        assert!(has_reasoning, "should detect reasoning_content emission");
+
+        // Without reasoning_content: model accepts but doesn't emit.
+        let without_reasoning = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+        let parsed: ProbeResponse = serde_json::from_str(without_reasoning).unwrap();
+        let has_reasoning = parsed
+            .choices
+            .first()
+            .and_then(|c| c.message.as_ref())
+            .is_some_and(|m| m.reasoning_content.is_some());
+        assert!(!has_reasoning, "should detect absence of reasoning_content");
     }
 
     #[test]

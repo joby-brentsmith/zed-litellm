@@ -34,7 +34,7 @@ Options:
 | `--settings` | `~/.config/zed/settings.json` | Zed settings file to update |
 | `--write` | off | Modify the file (default is dry-run to stdout) |
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
-| `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model) |
+| `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model). Only affects newly-discovered models unless `--replace` is also used |
 | `--reasoning-effort` | `medium` | Effort assigned to models with `supports_reasoning` |
 
 ## Field mapping
