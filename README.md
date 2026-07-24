@@ -20,16 +20,16 @@ zed-litellm --url http://localhost:4000 --api-key sk-...
 zed-litellm --url http://localhost:4000 --api-key sk-... --write
 ```
 
-The API key can also be provided via `LITELLM_ADMIN`, and the URL via
-`MOOSE_URL`. Zed hot-reloads `settings.json`, so new models appear in the
+The API key can also be provided via `LITELLM_ADMIN_KEY`, and the URL via
+`LITELLM_URL`. Zed hot-reloads `settings.json`, so new models appear in the
 model picker immediately — no restart needed.
 
 Options:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--url` | `$MOOSE_URL` | LiteLLM proxy base URL; `/v1` suffix ok |
-| `--api-key` | `$LITELLM_ADMIN` | Key with access to `/model/info` |
+| `--url` | `$LITELLM_URL` | LiteLLM proxy base URL; `/v1` suffix ok |
+| `--api-key` | `$LITELLM_ADMIN_KEY` | Key with access to `/model/info` |
 | `--provider` | `litellm` | Provider id under `language_models.openai_compatible` |
 | `--settings` | `~/.config/zed/settings.json` | Zed settings file to update |
 | `--write` | off | Modify the file (default is dry-run to stdout) |

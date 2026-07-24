@@ -22,11 +22,11 @@ const DEFAULT_MAX_TOKENS: u64 = 128_000;
 #[command(version, about)]
 struct Args {
     /// Base URL of the LiteLLM proxy (e.g. http://localhost:4000)
-    #[arg(long, env = "MOOSE_URL")]
+    #[arg(long, env = "LITELLM_URL")]
     url: String,
 
     /// API key for the proxy; must be allowed to call /model/info
-    #[arg(long, env = "LITELLM_ADMIN", hide_env_values = true)]
+    #[arg(long, env = "LITELLM_ADMIN_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
     /// Provider id to write under language_models.openai_compatible
