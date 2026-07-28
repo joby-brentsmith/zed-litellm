@@ -66,7 +66,7 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` (omitted when >= `max_tokens` — LiteLLM often reports it as the context window, which causes overflow errors) | `max_output_tokens` |
+| `max_output_tokens` | never written — LiteLLM's value is unreliable (often the context window), so models use their own default per-response cap |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |

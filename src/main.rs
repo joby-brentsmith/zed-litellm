@@ -85,7 +85,6 @@ struct ModelInfo {
     mode: Option<String>,
     max_input_tokens: Option<f64>,
     max_tokens: Option<f64>,
-    max_output_tokens: Option<f64>,
     supports_function_calling: Option<bool>,
     supports_parallel_function_calling: Option<bool>,
     supports_vision: Option<bool>,
@@ -324,20 +323,10 @@ fn to_zed_models(
             .unwrap_or(DEFAULT_MAX_TOKENS);
         model.insert("max_tokens".into(), json!(max_tokens));
 
-        // `max_output_tokens` is the per-response generation cap, NOT the
-        // context window. LiteLLM's /model/info frequently reports it equal
-        // to `max_input_tokens` (the context window), which is wrong: a model
-        // can't generate `context_window` tokens when there's any input.
-        // Writing that value makes Zed request `context_window` completion
-        // tokens, guaranteeing overflow errors whenever input is non-empty.
-        // Omit the field when LiteLLM's value is untrustworthy so the model
-        // uses its own default per-response cap.
-        if let Some(max_output) = info.max_output_tokens {
-            let max_output = max_output as u64;
-            if max_output < max_tokens {
-                model.insert("max_output_tokens".into(), json!(max_output));
-            }
-        }
+        // `max_output_tokens` is intentionally never written: LiteLLM's
+        // /model/info data for it is unreliable (frequently equal to the
+        // context window), and omitting it lets each model use its own
+        // default per-response cap.
         if info.supports_reasoning == Some(true) {
             model.insert("reasoning_effort".into(), json!(reasoning_effort));
         }
@@ -511,7 +500,6 @@ mod tests {
             ModelInfo {
                 mode: Some("chat".to_string()),
                 max_input_tokens: Some(128000.0),
-                max_output_tokens: Some(16384.0),
                 supports_function_calling: Some(true),
                 supports_parallel_function_calling: Some(true),
                 supports_vision: Some(true),
@@ -527,7 +515,6 @@ mod tests {
             vec![json!({
                 "name": "gpt-4o",
                 "max_tokens": 128000,
-                "max_output_tokens": 16384,
                 "capabilities": {
                     "tools": true,
                     "images": true,
@@ -604,43 +591,22 @@ mod tests {
         assert_eq!(models[0]["reasoning_effort"], "high");
     }
 
-    /// Regression guard: LiteLLM frequently reports `max_output_tokens`
-    /// equal to `max_input_tokens` (the context window). That's bad data — a
-    /// model can't generate `context_window` tokens with any input present,
-    /// and writing it makes Zed request that many completion tokens, causing
-    /// overflow errors. The tool must omit `max_output_tokens` when it's
-    /// untrustworthy (>= the resolved `max_tokens`).
+    /// Regression guard: LiteLLM's /model/info data for `max_output_tokens`
+    /// is unreliable (frequently equal to the context window), so the tool
+    /// must never write it — models fall back to their own default
+    /// per-response cap.
     #[test]
-    fn omits_max_output_tokens_when_untrustworthy() {
-        // max_output_tokens == max_input_tokens: untrustworthy, must omit.
+    fn never_emits_max_output_tokens() {
         let entries = vec![entry(
-            "bad-data-model",
-            ModelInfo {
-                max_input_tokens: Some(1048576.0),
-                max_output_tokens: Some(1048576.0),
-                ..Default::default()
-            },
-        )];
-        let models = to_zed_models(&entries, &[], "medium");
-        assert_eq!(models[0]["max_tokens"], json!(1048576));
-        assert_eq!(
-            models[0].get("max_output_tokens"),
-            None,
-            "must omit max_output_tokens when it equals the context window"
-        );
-
-        // max_output_tokens < max_input_tokens: trustworthy, keep it.
-        let entries = vec![entry(
-            "good-data-model",
+            "any-model",
             ModelInfo {
                 max_input_tokens: Some(200000.0),
-                max_output_tokens: Some(8192.0),
                 ..Default::default()
             },
         )];
         let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], json!(200000));
-        assert_eq!(models[0]["max_output_tokens"], json!(8192));
+        assert_eq!(models[0].get("max_output_tokens"), None);
     }
 
     #[test]
