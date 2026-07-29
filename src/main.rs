@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Parser;
@@ -339,6 +340,7 @@ fn check_one_model_liveness(api_url: &str, model_name: &str, api_key: Option<&st
     });
     let body = serde_json::to_string(&payload)?;
     let mut request = ureq::post(&url)
+        .timeout(Duration::from_secs(10))
         .set("Content-Type", "application/json")
         .set("Accept", "application/json");
     if let Some(api_key) = api_key {
@@ -375,14 +377,25 @@ fn check_liveness(
                 return entry.model_name.as_deref();
             };
             let mode = info.mode.as_deref();
-            // same filter as to_zed_models: chat, responses, or null mode
+            // Only probe chat-mode (or null-mode) models — responses-mode
+            // models are Responses-API-only (chat_completions: false) and
+            // can't be probed via /chat/completions (would be a false
+            // negative). Non-chat modes (embedding, image_generation, etc.)
+            // are also excluded.
             if let Some(m) = mode {
-                if m != "chat" && m != "responses" {
+                if m != "chat" {
                     return None;
                 }
             }
             entry.model_name.as_deref()
         })
+        // Dedup by model name — /model/info can return multiple deployments
+        // for the same model_name, and probing each is redundant.
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let candidates: Vec<&str> = candidates
+        .into_iter()
+        .filter(|name| seen.insert(*name))
         .collect();
 
     let mut results = Vec::new();

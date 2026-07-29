@@ -104,7 +104,7 @@ reasoning model, so it's opt-in.
 ## Null-field warnings
 
 If any chat model on the gateway has `null` capability fields (the recurring
-sbug where sbatch register payloads omit them), the sync prints a warning to
+bug where sbatch register payloads omit them), the sync prints a warning to
 stderr listing each affected model and which fields are null. The sync still
 runs (falling back to defaults), but the warning surfaces the gap so you know
 the gateway cards need fixing — not the Zed settings. This is the same class
