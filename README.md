@@ -59,6 +59,8 @@ Options:
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
 | `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model). Only affects newly-discovered models unless `--replace` is also used |
 | `--reasoning-effort` | `medium` | Effort assigned to models with `supports_reasoning` |
+| `--check-liveness` | off | Send a 1-token completion to each discovered chat model and report which are live vs returning an HTTP error (catches stale aliases / dead backends after a cutover). Report-only — dead models are still synced |
+| `-f`, `--full` | off | Shorthand for `--write --replace --probe --check-liveness` — the one-shot "make my Zed config accurate" sync. Regenerates every model entry from `/model/info`, probes reasoning models for interleaved_reasoning, checks liveness, and writes the result |
 
 ## Field mapping
 
@@ -98,6 +100,25 @@ reasoning model, so it's opt-in.
   `custom_headers` are left alone.
 - `--write` creates a `settings.json.bak` backup next to the settings file
   before modifying it.
+
+## Null-field warnings
+
+If any chat model on the gateway has `null` capability fields (the recurring
+sbug where sbatch register payloads omit them), the sync prints a warning to
+stderr listing each affected model and which fields are null. The sync still
+runs (falling back to defaults), but the warning surfaces the gap so you know
+the gateway cards need fixing — not the Zed settings. This is the same class
+of bug that `llaminar/tools/lint-register-payloads.py` catches at the source.
+
+## Liveness check
+
+Pass `--check-liveness` to send a 1-token chat completion to each discovered
+chat model before syncing. Models that return a 2xx are reported as live;
+non-2xx (e.g. 403 from an upstream rate-limit, 500 from a dead backend) or
+network errors are reported as `NOT LIVE` with the error detail. This catches
+stale aliases pointing at rolled-back backends before they land in your Zed
+model picker. Dead models are still synced — the check is report-only so you
+can decide whether to remove them.
 
 ## Build
 
