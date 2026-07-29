@@ -120,6 +120,34 @@ stale aliases pointing at rolled-back backends before they land in your Zed
 model picker. Dead models are still synced — the check is report-only so you
 can decide whether to remove them.
 
+## Zed task integration
+
+Add a task to `~/.config/zed/tasks.json` so you can sync from the command
+palette (`task::spawn` → "sync litellm models") or a keybinding:
+
+```json
+[
+  {
+    "label": "sync litellm models",
+    "command": "zed-litellm -f",
+    "hide": "on_success"
+  }
+]
+```
+
+Zed hot-reloads `settings.json`, so new models appear in the picker
+immediately after the task finishes. To bind it to a key, add to
+`keymap.json`:
+
+```json
+{
+  "context": "Workspace",
+  "bindings": {
+    "cmd-shift-l": ["task::Spawn", { "task_name": "sync litellm models" }]
+  }
+}
+```
+
 ## Build
 
 ```sh
