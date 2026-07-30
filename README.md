@@ -59,6 +59,8 @@ Options:
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
 | `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model). Only affects newly-discovered models unless `--replace` is also used |
 | `--reasoning-effort` | `medium` | Effort assigned to models with `supports_reasoning` |
+| `--check-liveness` | off | Send a 1-token completion to each discovered chat model and report which are live vs returning an HTTP error (catches stale aliases / dead backends after a cutover). Report-only — dead models are still synced |
+| `-f`, `--full` | off | Shorthand for `--write --replace --probe --check-liveness` — the one-shot "make my Zed config accurate" sync. Regenerates every model entry from `/model/info`, probes reasoning models for interleaved_reasoning, checks liveness, and writes the result |
 
 ## Field mapping
 
@@ -66,7 +68,7 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` (omitted when >= `max_tokens` — LiteLLM often reports it as the context window, which causes overflow errors) | `max_output_tokens` |
+| `max_output_tokens` | never written — LiteLLM's value is unreliable (often the context window), so models use their own default per-response cap |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
@@ -98,6 +100,53 @@ reasoning model, so it's opt-in.
   `custom_headers` are left alone.
 - `--write` creates a `settings.json.bak` backup next to the settings file
   before modifying it.
+
+## Null-field warnings
+
+If any chat model on the gateway has `null` capability fields (the recurring
+bug where sbatch register payloads omit them), the sync prints a warning to
+stderr listing each affected model and which fields are null. The sync still
+runs (falling back to defaults), but the warning surfaces the gap so you know
+the gateway cards need fixing — not the Zed settings. This is the same class
+of bug that `llaminar/tools/lint-register-payloads.py` catches at the source.
+
+## Liveness check
+
+Pass `--check-liveness` to send a 1-token chat completion to each discovered
+chat model before syncing. Models that return a 2xx are reported as live;
+non-2xx (e.g. 403 from an upstream rate-limit, 500 from a dead backend) or
+network errors are reported as `NOT LIVE` with the error detail. This catches
+stale aliases pointing at rolled-back backends before they land in your Zed
+model picker. Dead models are still synced — the check is report-only so you
+can decide whether to remove them.
+
+## Zed task integration
+
+Add a task to `~/.config/zed/tasks.json` so you can sync from the command
+palette (`task::spawn` → "sync litellm models") or a keybinding:
+
+```json
+[
+  {
+    "label": "sync litellm models",
+    "command": "zed-litellm -f",
+    "hide": "on_success"
+  }
+]
+```
+
+Zed hot-reloads `settings.json`, so new models appear in the picker
+immediately after the task finishes. To bind it to a key, add to
+`keymap.json`:
+
+```json
+{
+  "context": "Workspace",
+  "bindings": {
+    "cmd-shift-l": ["task::Spawn", { "task_name": "sync litellm models" }]
+  }
+}
+```
 
 ## Build
 

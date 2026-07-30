@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use clap::Parser;
@@ -60,6 +61,21 @@ struct Args {
     /// reasoning_effort assigned to models that report supports_reasoning
     #[arg(long, default_value = "medium")]
     reasoning_effort: String,
+
+    /// Send a 1-token chat completion to each discovered chat model and report
+    /// which ones are live vs returning an HTTP error or timing out. Useful
+    /// after a fleet cutover/rollback to catch stale aliases pointing at dead
+    /// backends before they land in your Zed model picker. Report-only — dead
+    /// models are still synced (you decide whether to remove them).
+    #[arg(long)]
+    check_liveness: bool,
+
+    /// Full sync: shorthand for --write --replace --probe --check-liveness.
+    /// Regenerates every model entry from /model/info, probes reasoning models
+    /// for interleaved_reasoning, checks liveness, and writes the result to
+    /// your Zed settings. This is the "make my Zed config accurate" one-shot.
+    #[arg(short = 'f', long = "full")]
+    full: bool,
 }
 
 fn default_settings_path() -> PathBuf {
@@ -85,7 +101,6 @@ struct ModelInfo {
     mode: Option<String>,
     max_input_tokens: Option<f64>,
     max_tokens: Option<f64>,
-    max_output_tokens: Option<f64>,
     supports_function_calling: Option<bool>,
     supports_parallel_function_calling: Option<bool>,
     supports_vision: Option<bool>,
@@ -96,11 +111,36 @@ struct ModelInfo {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // -f / --full is shorthand for --write --replace --probe --check-liveness.
+    let (write, replace, probe, do_liveness) = if args.full {
+        (true, true, true, true)
+    } else {
+        (args.write, args.replace, args.probe, args.check_liveness)
+    };
+
     let base_url = normalize_base_url(&args.url);
     let api_url = format!("{base_url}/v1");
 
     let entries = fetch_model_info(&base_url, args.api_key.as_deref())?;
-    let interleaved = if args.probe {
+
+    // Warn about null capability fields on the gateway cards — the recurring
+    // bug class where sbatch register payloads omit the fields so /model/info
+    // returns null and the sync quietly writes wrong defaults.
+    let null_warnings = warn_null_fields(&entries);
+    if !null_warnings.is_empty() {
+        eprintln!(
+            "warning: {} chat model(s) have null capability fields on the gateway;",
+            null_warnings.len()
+        );
+        eprintln!("  the sync will fall back to defaults that may be wrong. Fix the");
+        eprintln!("  LiteLLM model cards (not the Zed settings) to resolve:");
+        for w in &null_warnings {
+            eprintln!("{w}");
+        }
+        eprintln!();
+    }
+
+    let interleaved = if probe {
         eprintln!("Probing reasoning models for interleaved_reasoning support...");
         probe_interleaved_reasoning(&api_url, &entries, args.api_key.as_deref())
     } else {
@@ -111,6 +151,28 @@ fn main() -> Result<()> {
         bail!("no chat models returned by {base_url}/model/info");
     }
 
+    // Liveness check: probe each chat model with a 1-token completion to catch
+    // dead backends / stale aliases before they land in the Zed picker.
+    // Report-only — dead models are still synced.
+    if do_liveness {
+        eprintln!("Checking liveness of chat models...");
+        let results = check_liveness(&api_url, &entries, args.api_key.as_deref());
+        let dead: Vec<_> = results.iter().filter(|r| !r.live).collect();
+        if dead.is_empty() {
+            eprintln!("All {} chat model(s) are live.", results.len());
+        } else {
+            eprintln!(
+                "{} of {} chat model(s) NOT LIVE:",
+                dead.len(),
+                results.len()
+            );
+            for r in &dead {
+                eprintln!("  {}: {}", r.model, r.detail);
+            }
+        }
+        eprintln!();
+    }
+
     let settings_text = match fs::read_to_string(&args.settings) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".to_string(),
@@ -119,7 +181,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let models = if args.replace {
+    let models = if replace {
         eprintln!(
             "Discovered {} chat model(s) from {base_url} (replacing existing entries)",
             discovered.len()
@@ -137,7 +199,7 @@ fn main() -> Result<()> {
 
     let merged = merge_into_settings(&settings_text, &args.provider, &api_url, models)?;
 
-    if args.write {
+    if write {
         let backup = args.settings.with_extension("json.bak");
         if args.settings.exists() {
             fs::copy(&args.settings, &backup)
@@ -266,6 +328,157 @@ fn probe_one_model(api_url: &str, model_name: &str, api_key: Option<&str>) -> Re
     Ok(message.reasoning_content.is_some())
 }
 
+/// Check a single chat model for liveness by sending a 1-token completion.
+/// Returns Ok(()) if the model responded 2xx, or Err with the HTTP status /
+/// network error detail.
+fn check_one_model_liveness(api_url: &str, model_name: &str, api_key: Option<&str>) -> Result<()> {
+    let url = format!("{api_url}/chat/completions");
+    let payload = json!({
+        "model": model_name,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ok"}],
+    });
+    let body = serde_json::to_string(&payload)?;
+    let mut request = ureq::post(&url)
+        .timeout(Duration::from_secs(10))
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json");
+    if let Some(api_key) = api_key {
+        request = request.set("Authorization", &format!("Bearer {api_key}"));
+    }
+    request
+        .send_string(&body)
+        .with_context(|| format!("liveness probe for {model_name}"))?;
+    Ok(())
+}
+
+/// Result of a liveness check for one model.
+struct LivenessResult {
+    model: String,
+    live: bool,
+    detail: String,
+}
+
+/// Probe each chat model with a 1-token completion and report liveness.
+/// A model is "live" if the gateway returned 2xx (the backend answered,
+/// however briefly). Non-2xx (e.g. 403 from an upstream rate-limit, 500 from a
+/// dead backend) or network errors are reported as not live with the detail.
+/// Models are NOT removed from the sync — this is report-only so the user
+/// can decide whether to remove dead entries from their settings.
+fn check_liveness(
+    api_url: &str,
+    entries: &[ModelEntry],
+    api_key: Option<&str>,
+) -> Vec<LivenessResult> {
+    let candidates: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| {
+            let Some(info) = entry.model_info.as_ref() else {
+                return entry.model_name.as_deref();
+            };
+            let mode = info.mode.as_deref();
+            // Only probe chat-mode (or null-mode) models — responses-mode
+            // models are Responses-API-only (chat_completions: false) and
+            // can't be probed via /chat/completions (would be a false
+            // negative). Non-chat modes (embedding, image_generation, etc.)
+            // are also excluded.
+            if let Some(m) = mode {
+                if m != "chat" {
+                    return None;
+                }
+            }
+            entry.model_name.as_deref()
+        })
+        // Dedup by model name — /model/info can return multiple deployments
+        // for the same model_name, and probing each is redundant.
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let candidates: Vec<&str> = candidates
+        .into_iter()
+        .filter(|name| seen.insert(*name))
+        .collect();
+
+    let mut results = Vec::new();
+    for model_name in candidates {
+        match check_one_model_liveness(api_url, model_name, api_key) {
+            Ok(()) => {
+                eprintln!("  {model_name}: live");
+                results.push(LivenessResult {
+                    model: model_name.to_string(),
+                    live: true,
+                    detail: String::new(),
+                });
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                eprintln!("  {model_name}: NOT LIVE — {detail}");
+                results.push(LivenessResult {
+                    model: model_name.to_string(),
+                    live: false,
+                    detail,
+                });
+            }
+        }
+    }
+    results
+}
+
+/// Check chat-model entries for null capability fields and return warning lines.
+///
+/// Null fields cause the sync to fall back to defaults that may be wrong:
+///   - `supports_vision: null` → `false` (vision silently disabled)
+///   - `supports_reasoning: null` → `reasoning_effort` omitted (capability loss)
+///   - `supports_function_calling: null` → `true` (may be wrong for vision-only)
+///
+/// This is the recurring bug class where sbatch register payloads omit the
+/// capability fields, so `/model/info` returns null, and the sync quietly
+/// writes wrong defaults. The warning surfaces the gap so the operator knows
+/// the gateway cards need fixing (not the Zed settings).
+///
+/// Only chat models (mode = "chat", "responses", or null) are checked —
+/// non-chat modes (embedding, image_generation, etc.) legitimately lack
+/// these fields.
+fn warn_null_fields(entries: &[ModelEntry]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.model_name.as_deref() else {
+            continue;
+        };
+        let Some(info) = entry.model_info.as_ref() else {
+            continue;
+        };
+        let mode = info.mode.as_deref();
+        if let Some(m) = mode {
+            if m != "chat" && m != "responses" {
+                continue;
+            }
+        }
+        let mut gaps: Vec<&str> = Vec::new();
+        if info.supports_function_calling.is_none() {
+            gaps.push("supports_function_calling (defaults to true — may be wrong)");
+        }
+        if info.supports_vision.is_none() {
+            gaps.push("supports_vision (defaults to false — vision silently disabled)");
+        }
+        if info.supports_parallel_function_calling.is_none() {
+            gaps.push("supports_parallel_function_calling (defaults to false)");
+        }
+        if info.supports_reasoning.is_none() {
+            gaps.push("supports_reasoning (reasoning_effort omitted — capability loss)");
+        }
+        if info.max_input_tokens.is_none() && info.max_tokens.is_none() {
+            gaps.push("max_input_tokens (defaults to 128000)");
+        }
+        if info.mode.is_none() {
+            gaps.push("mode (null — included as chat, but strict clients may skip)");
+        }
+        if !gaps.is_empty() {
+            warnings.push(format!("  {name}: {}", gaps.join("; ")));
+        }
+    }
+    warnings
+}
+
 #[derive(Deserialize)]
 struct ProbeResponse {
     choices: Vec<ProbeChoice>,
@@ -324,20 +537,10 @@ fn to_zed_models(
             .unwrap_or(DEFAULT_MAX_TOKENS);
         model.insert("max_tokens".into(), json!(max_tokens));
 
-        // `max_output_tokens` is the per-response generation cap, NOT the
-        // context window. LiteLLM's /model/info frequently reports it equal
-        // to `max_input_tokens` (the context window), which is wrong: a model
-        // can't generate `context_window` tokens when there's any input.
-        // Writing that value makes Zed request `context_window` completion
-        // tokens, guaranteeing overflow errors whenever input is non-empty.
-        // Omit the field when LiteLLM's value is untrustworthy so the model
-        // uses its own default per-response cap.
-        if let Some(max_output) = info.max_output_tokens {
-            let max_output = max_output as u64;
-            if max_output < max_tokens {
-                model.insert("max_output_tokens".into(), json!(max_output));
-            }
-        }
+        // `max_output_tokens` is intentionally never written: LiteLLM's
+        // /model/info data for it is unreliable (frequently equal to the
+        // context window), and omitting it lets each model use its own
+        // default per-response cap.
         if info.supports_reasoning == Some(true) {
             model.insert("reasoning_effort".into(), json!(reasoning_effort));
         }
@@ -511,7 +714,6 @@ mod tests {
             ModelInfo {
                 mode: Some("chat".to_string()),
                 max_input_tokens: Some(128000.0),
-                max_output_tokens: Some(16384.0),
                 supports_function_calling: Some(true),
                 supports_parallel_function_calling: Some(true),
                 supports_vision: Some(true),
@@ -527,7 +729,6 @@ mod tests {
             vec![json!({
                 "name": "gpt-4o",
                 "max_tokens": 128000,
-                "max_output_tokens": 16384,
                 "capabilities": {
                     "tools": true,
                     "images": true,
@@ -604,43 +805,22 @@ mod tests {
         assert_eq!(models[0]["reasoning_effort"], "high");
     }
 
-    /// Regression guard: LiteLLM frequently reports `max_output_tokens`
-    /// equal to `max_input_tokens` (the context window). That's bad data — a
-    /// model can't generate `context_window` tokens with any input present,
-    /// and writing it makes Zed request that many completion tokens, causing
-    /// overflow errors. The tool must omit `max_output_tokens` when it's
-    /// untrustworthy (>= the resolved `max_tokens`).
+    /// Regression guard: LiteLLM's /model/info data for `max_output_tokens`
+    /// is unreliable (frequently equal to the context window), so the tool
+    /// must never write it — models fall back to their own default
+    /// per-response cap.
     #[test]
-    fn omits_max_output_tokens_when_untrustworthy() {
-        // max_output_tokens == max_input_tokens: untrustworthy, must omit.
+    fn never_emits_max_output_tokens() {
         let entries = vec![entry(
-            "bad-data-model",
-            ModelInfo {
-                max_input_tokens: Some(1048576.0),
-                max_output_tokens: Some(1048576.0),
-                ..Default::default()
-            },
-        )];
-        let models = to_zed_models(&entries, &[], "medium");
-        assert_eq!(models[0]["max_tokens"], json!(1048576));
-        assert_eq!(
-            models[0].get("max_output_tokens"),
-            None,
-            "must omit max_output_tokens when it equals the context window"
-        );
-
-        // max_output_tokens < max_input_tokens: trustworthy, keep it.
-        let entries = vec![entry(
-            "good-data-model",
+            "any-model",
             ModelInfo {
                 max_input_tokens: Some(200000.0),
-                max_output_tokens: Some(8192.0),
                 ..Default::default()
             },
         )];
         let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], json!(200000));
-        assert_eq!(models[0]["max_output_tokens"], json!(8192));
+        assert_eq!(models[0].get("max_output_tokens"), None);
     }
 
     #[test]
@@ -871,5 +1051,85 @@ mod tests {
             normalize_base_url("http://localhost:4000/v1/"),
             "http://localhost:4000"
         );
+    }
+
+    #[test]
+    fn warn_null_fields_reports_null_capabilities() {
+        let entries = vec![entry(
+            "laguna-s-2.1",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                max_input_tokens: Some(262144.0),
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+
+        let warnings = warn_null_fields(&entries);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("laguna-s-2.1"));
+        assert!(warnings[0].contains("supports_function_calling"));
+        assert!(warnings[0].contains("supports_vision"));
+        assert!(warnings[0].contains("supports_parallel_function_calling"));
+        assert!(!warnings[0].contains("supports_reasoning"));
+        assert!(!warnings[0].contains("max_input_tokens"));
+    }
+
+    #[test]
+    fn warn_null_fields_clean_when_all_set() {
+        let entries = vec![entry(
+            "glm-5.2",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                max_input_tokens: Some(1048576.0),
+                supports_function_calling: Some(true),
+                supports_parallel_function_calling: Some(true),
+                supports_vision: Some(false),
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+
+        let warnings = warn_null_fields(&entries);
+        assert!(
+            warnings.is_empty(),
+            "no warnings when all fields set: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warn_null_fields_skips_non_chat_models() {
+        let entries = vec![entry(
+            "qwen3-embedding-0.6b",
+            ModelInfo {
+                mode: Some("embedding".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        let warnings = warn_null_fields(&entries);
+        assert!(
+            warnings.is_empty(),
+            "embedding models should not be flagged: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warn_null_fields_flags_null_mode() {
+        let entries = vec![entry(
+            "qwythos-9b",
+            ModelInfo {
+                max_input_tokens: Some(1010000.0),
+                supports_function_calling: Some(true),
+                supports_parallel_function_calling: Some(true),
+                supports_vision: Some(false),
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+
+        let warnings = warn_null_fields(&entries);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("mode (null"));
     }
 }
