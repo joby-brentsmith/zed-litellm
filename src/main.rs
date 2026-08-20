@@ -13,6 +13,14 @@ use serde_json::{json, Value};
 /// `max_input_tokens`.
 const DEFAULT_MAX_TOKENS: u64 = 128_000;
 
+/// Safe per-response output cap when the LiteLLM card's `max_output_tokens`
+/// is missing or unreliable. LiteLLM frequently reports `max_output_tokens`
+/// equal to the context window — the impossible `out==in` value that leaves
+/// no room for input and trips `input + max_tokens > context` 400s when a
+/// client fills the window. This default is generous for normal coding
+/// responses and is always clamped to the context window at emit time.
+const DEFAULT_OUTPUT_TOKENS: u64 = 65_536;
+
 /// Sync models from a LiteLLM proxy into Zed's settings.
 ///
 /// Queries the proxy's `/model/info` endpoint and updates the
@@ -101,6 +109,7 @@ struct ModelInfo {
     mode: Option<String>,
     max_input_tokens: Option<f64>,
     max_tokens: Option<f64>,
+    max_output_tokens: Option<f64>,
     supports_function_calling: Option<bool>,
     supports_parallel_function_calling: Option<bool>,
     supports_vision: Option<bool>,
@@ -537,10 +546,18 @@ fn to_zed_models(
             .unwrap_or(DEFAULT_MAX_TOKENS);
         model.insert("max_tokens".into(), json!(max_tokens));
 
-        // `max_output_tokens` is intentionally never written: LiteLLM's
-        // /model/info data for it is unreliable (frequently equal to the
-        // context window), and omitting it lets each model use its own
-        // default per-response cap.
+        // LiteLLM's `max_output_tokens` card value is unreliable (frequently
+        // equal to the context window — an impossible value that leaves no
+        // room for input and trips `input + max_tokens > context` 400s when a
+        // client fills the window). Emit a sane cap instead: honor a card
+        // value only when it's a deliberate sub-window cap; otherwise fall
+        // back to DEFAULT_OUTPUT_TOKENS, clamped to the context window.
+        let max_output_tokens = match info.max_output_tokens {
+            Some(cap) if (cap as u64) > 0 && (cap as u64) < max_tokens => cap as u64,
+            _ => DEFAULT_OUTPUT_TOKENS.min(max_tokens),
+        };
+        model.insert("max_output_tokens".into(), json!(max_output_tokens));
+
         if info.supports_reasoning == Some(true) {
             model.insert("reasoning_effort".into(), json!(reasoning_effort));
         }
@@ -729,6 +746,7 @@ mod tests {
             vec![json!({
                 "name": "gpt-4o",
                 "max_tokens": 128000,
+                "max_output_tokens": 65_536,
                 "capabilities": {
                     "tools": true,
                     "images": true,
@@ -805,22 +823,62 @@ mod tests {
         assert_eq!(models[0]["reasoning_effort"], "high");
     }
 
-    /// Regression guard: LiteLLM's /model/info data for `max_output_tokens`
-    /// is unreliable (frequently equal to the context window), so the tool
-    /// must never write it — models fall back to their own default
-    /// per-response cap.
+    /// The card's `max_output_tokens` is unreliable (frequently equal to
+    /// the context window — the impossible `out==in` value), so the sync must
+    /// substitute a sane cap rather than propagate it or omit the field:
+    ///   - `out==in` card → DEFAULT_OUTPUT_TOKENS, clamped to the context window
+    ///   - null card      → same fallback
+    ///   - a deliberate sub-window cap → honored
+    ///   - default never exceeds a small context window
     #[test]
-    fn never_emits_max_output_tokens() {
-        let entries = vec![entry(
-            "any-model",
+    fn emits_safe_max_output_tokens() {
+        // out==in (the glm-5.2-1M / kimi-k3-azure bug): fall back to default.
+        let out_eq_in = vec![entry(
+            "glm-5.2-1M",
             ModelInfo {
-                max_input_tokens: Some(200000.0),
+                max_input_tokens: Some(1_048_576.0),
+                max_output_tokens: Some(1_048_576.0),
                 ..Default::default()
             },
         )];
-        let models = to_zed_models(&entries, &[], "medium");
-        assert_eq!(models[0]["max_tokens"], json!(200000));
-        assert_eq!(models[0].get("max_output_tokens"), None);
+        let m = to_zed_models(&out_eq_in, &[], "medium");
+        assert_eq!(m[0]["max_tokens"], json!(1_048_576));
+        assert_eq!(m[0]["max_output_tokens"], json!(65_536));
+
+        // null card: same fallback.
+        let null_card = vec![entry(
+            "any-model",
+            ModelInfo {
+                max_input_tokens: Some(200_000.0),
+                ..Default::default()
+            },
+        )];
+        let m = to_zed_models(&null_card, &[], "medium");
+        assert_eq!(m[0]["max_tokens"], json!(200_000));
+        assert_eq!(m[0]["max_output_tokens"], json!(65_536));
+
+        // deliberate sub-window cap: honored.
+        let deliberate = vec![entry(
+            "capped-model",
+            ModelInfo {
+                max_input_tokens: Some(262_144.0),
+                max_output_tokens: Some(32_768.0),
+                ..Default::default()
+            },
+        )];
+        let m = to_zed_models(&deliberate, &[], "medium");
+        assert_eq!(m[0]["max_output_tokens"], json!(32_768));
+
+        // default never exceeds a small context window (e.g. qwen3-vl 32768).
+        let small_ctx = vec![entry(
+            "qwen3-vl",
+            ModelInfo {
+                max_input_tokens: Some(32_768.0),
+                ..Default::default()
+            },
+        )];
+        let m = to_zed_models(&small_ctx, &[], "medium");
+        assert_eq!(m[0]["max_output_tokens"], json!(32_768));
     }
 
     #[test]
@@ -914,7 +972,7 @@ mod tests {
 
         let models = to_zed_models(&entries, &[], "medium");
         assert_eq!(models[0]["max_tokens"], DEFAULT_MAX_TOKENS);
-        assert_eq!(models[0].get("max_output_tokens"), None);
+        assert_eq!(models[0]["max_output_tokens"], json!(65_536));
     }
 
     #[test]
