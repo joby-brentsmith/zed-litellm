@@ -68,7 +68,7 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` | never written — LiteLLM's value is unreliable (often the context window), so models use their own default per-response cap |
+| `max_output_tokens` | a sane cap — LiteLLM's value is unreliable (often equal to the context window — the impossible `out==in` value), so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped to the context window |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
