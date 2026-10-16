@@ -317,7 +317,7 @@ fn merge_deployments(entries: &[ModelEntry]) -> Vec<ModelEntry> {
             model_name: Some(name),
             model_info: Some(merge_infos(&group)),
         })
- .collect()
+        .collect()
 }
 
 fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
@@ -384,33 +384,20 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
         ),
         max_tokens: None,
         max_output_tokens: min_of(infos.iter().map(|info| info.max_output_tokens).collect()),
-        supports_function_calling: and(
-            infos
-                .iter()
-                .map(|info| info.supports_function_calling)
-                .collect(),
-        ),
-        supports_parallel_function_calling: and(
-            infos
-                .iter()
-                .map(|info| info.supports_parallel_function_calling)
-                .collect(),
-        ),
-        supports_vision: and(
-            infos.iter().map(|info| info.supports_vision).collect(),
-        ),
-        supports_prompt_caching: and(
-            infos
-                .iter()
-                .map(|info| info.supports_prompt_caching)
-                .collect(),
-        ),
-        supports_reasoning: and(
-            infos
-                .iter()
-                .map(|info| info.supports_reasoning)
-                .collect(),
-        ),
+        supports_function_calling: and(infos
+            .iter()
+            .map(|info| info.supports_function_calling)
+            .collect()),
+        supports_parallel_function_calling: and(infos
+            .iter()
+            .map(|info| info.supports_parallel_function_calling)
+            .collect()),
+        supports_vision: and(infos.iter().map(|info| info.supports_vision).collect()),
+        supports_prompt_caching: and(infos
+            .iter()
+            .map(|info| info.supports_prompt_caching)
+            .collect()),
+        supports_reasoning: and(infos.iter().map(|info| info.supports_reasoning).collect()),
         default_reasoning_effort: agree(
             infos
                 .iter()
@@ -716,12 +703,17 @@ fn to_zed_models(
             .unwrap_or(DEFAULT_MAX_TOKENS);
         model.insert("max_tokens".into(), json!(max_tokens));
 
-        // LiteLLM's `max_output_tokens` card value is unreliable (frequently
-        // equal to the context window — an impossible value that leaves no
-        // room for input and trips `input + max_tokens > context` 400s when a
-        // client fills the window). Emit a sane cap instead: honor a card
-        // value only when it's a deliberate sub-window cap; otherwise fall
-        // back to DEFAULT_OUTPUT_TOKENS, clamped to the context window.
+        // LiteLLM's `max_output_tokens` card value can't be trusted as a
+        // Zed side setting: llaminar deliberately clamps every glm-5.3-family
+        // card to 262144/262144 (the 2026-09-22 session — mirrors the Baseten
+        // twins' standalone enforcement), and vanilla LiteLLM deployments
+        // report the impossible out==in shape through card rot. Either way,
+        // emitting out==window into Zed is the llaminar#94 class-A shape:
+        // a window-filling prompt plus a full-window cap collapses the
+        // backend budget to ~1 and returns an empty 200. Emit a sane cap
+        // instead: honor the card value only when it's a deliberate
+        // sub-window cap; otherwise fall back to DEFAULT_OUTPUT_TOKENS,
+        // clamped (with reserve) below the context window.
         let mut max_output_tokens = match info.max_output_tokens {
             Some(cap) if (cap as u64) > 0 && (cap as u64) < max_tokens => cap as u64,
             _ => DEFAULT_OUTPUT_TOKENS.min(max_tokens),
@@ -773,6 +765,12 @@ fn to_zed_models(
         // a blind `true` degrades multi-turn reasoning on endpoints
         // that silently ignore the field.
         caps.insert("interleaved_reasoning".into(), json!(interleaved_support));
+        // Zed's `openai_compatible` provider defaults to sending the output
+        // cap as `max_completion_tokens` on the wire; classic `max_tokens` is
+        // the one every backend on this fleet accepts (SGLang, vLLM, the
+        // Baseten twins), so pin the classic shape explicitly. Unknown to
+        // older Zed, which just ignores the field.
+        caps.insert("max_tokens_parameter".into(), json!(true));
         // A `responses`-mode model only works with the Responses API.
         // Zed defaults `chat_completions` to true, so we must explicitly
         // set it to false to avoid routing to /chat/completions.
@@ -980,7 +978,11 @@ mod tests {
         let merged = merge_deployments(&entries);
         assert_eq!(merged.len(), 1);
         let info = merged[0].model_info.as_ref().unwrap();
-        assert_eq!(info.max_input_tokens, Some(262_144.0), "min across reporters");
+        assert_eq!(
+            info.max_input_tokens,
+            Some(262_144.0),
+            "min across reporters"
+        );
         assert_eq!(info.max_output_tokens, Some(262_144.0));
         assert_eq!(info.supports_function_calling, Some(true));
         assert_eq!(info.supports_vision, Some(false), "any-false wins");
@@ -1095,7 +1097,11 @@ mod tests {
         let merged = merge_deployments(&entries);
         // Deployments disagree -> no card default, CLI fallback applies.
         assert_eq!(
-            merged[0].model_info.as_ref().unwrap().default_reasoning_effort,
+            merged[0]
+                .model_info
+                .as_ref()
+                .unwrap()
+                .default_reasoning_effort,
             None
         );
         let models = to_zed_models(&merged, &[], "medium");
@@ -1131,6 +1137,7 @@ mod tests {
                     "parallel_tool_calls": true,
                     "prompt_cache_key": true,
                     "interleaved_reasoning": false,
+                    "max_tokens_parameter": true,
                 }
             })]
         );
@@ -1160,12 +1167,17 @@ mod tests {
             caps.get("interleaved_reasoning").is_some(),
             "missing interleaved_reasoning"
         );
+        assert!(
+            caps.get("max_tokens_parameter").is_some(),
+            "missing max_tokens_parameter"
+        );
         // A model with no reported capabilities should still get safe defaults.
         assert_eq!(caps["tools"], json!(true));
         assert_eq!(caps["images"], json!(false));
         assert_eq!(caps["parallel_tool_calls"], json!(false));
         assert_eq!(caps["prompt_cache_key"], json!(false));
         assert_eq!(caps["interleaved_reasoning"], json!(false));
+        assert_eq!(caps["max_tokens_parameter"], json!(true));
     }
 
     #[test]

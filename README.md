@@ -69,13 +69,14 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` | a sane cap — LiteLLM's value is unreliable (often equal to the context window — the impossible `out==in` value), so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped just *below* the context window (a cap exactly at the advertised window is the llaminar empty-generation class: the backend collapses the budget to ~1 and returns an empty 200 — joby-software/llaminar#94) |
+| `max_output_tokens` | a sane cap — llaminar deliberately pins glm-family cards to the out==in 262144 shape (the 2026-09-22 clamp, mirroring the Baseten twins), and other LiteLLM deployments report the same shape through card rot. Either way an out==window cap in Zed is the llaminar#94 empty-200 class, so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped just *below* the context window (reserve headroom: at the advertised-window edge the GLM 5.3 family collapses the budget to ~1 and returns an empty 200) |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
 | `supports_prompt_caching` (default false) | `capabilities.prompt_cache_key` |
 | `supports_reasoning` | `reasoning_effort` — the card's `default_reasoning_effort` (when all deployments agree) wins; otherwise the `--reasoning-effort` value |
 | `interleaved_reasoning` (probed) | `capabilities.interleaved_reasoning` — only when `--probe` confirms the model both accepts and emits `reasoning_content` |
+| (nothing — emitted unconditionally) | `capabilities.max_tokens_parameter: true` — Zed's `openai_compatible` default sends the output cap as `max_completion_tokens`; classic `max_tokens` is what every backend on this fleet accepts (SGLang, vLLM, the Baseten twins), so the classic shape is pinned explicitly. Unknown to older Zed, which ignores it |
 
 Non-chat models (`mode` of `embedding`, `image_generation`, ...) are skipped,
 and duplicate deployments of the same `model_name` are merged into one conservative card per the semantics established for the same endpoint in vscode-llaminar ([joby-software/vscode-llaminar#61](https://github.com/joby-software/vscode-llaminar/issues/61), [PR #63](https://github.com/joby-software/vscode-llaminar/pull/63)): capability booleans are AND-merged (any-false → false, all-true → true, else unknown→default-with-warning), and token limits are the minimum across the reporting deployments. First-wins dedupe would let entry ordering decide your model picker.
@@ -113,6 +114,26 @@ These are live-verified behaviors of Joby's llaminar gateway
 - **`max_output_tokens == window` is a real failure mode** on the GLM 5.3
   family — the empty-200 budget collapse ([llaminar#94](https://github.com/joby-software/llaminar/issues/94)) — so generated caps
   always leave reserve headroom below the advertised window.
+- **Generated caps are NOT fallback-chain-aware — hand-tune for that.**
+  The sync cannot see backend enforcement shapes (they're fleet operating
+  knowledge in llaminar's `docs/post-boot-registration.md`, not card fields):
+  on-prem GLM rigs enforce a `prompt + max_tokens ≤ 1,048,576` sum gate, the
+  Baseten twins enforce `max_tokens ≤ 262144` standalone (no sum check),
+  and the qwen twin `qwen3.8-27b-onprem` enforces a strict 262,144 total
+  (live-verified 2026-10-16: 262144 out → 400, 24576 → 200). So for an alias
+  whose `fallback_models` hop has a smaller gate than the primary — e.g.
+  `joby-onprem`, which hops to `qwen3.8-27b-onprem` — a synced 65536 output
+  cap still 400s every *hopped* long-context request. The fix is a
+  hand-tuned preserved entry: with Zed's 90% auto-compaction boundary of a
+  262144 window (~236k), `236k + 24576 = 260.5k ≤ 262144` — cap such aliases'
+  `max_output_tokens` at ~24k (the `/model/info` card's `fallback_models`
+  field at least tells you *which* chains to check).
+- **Zed schema notes (verified against Zed `main` 2026-10-16):** the
+  `capabilities` block requires `tools`, `images`, `parallel_tool_calls`,
+  and `prompt_cache_key` (no serde defaults — blocks omitting them fail to
+  load, the exact regression this tool guards against);
+  `reasoning_effort` accepts `none|minimal|low|medium|high|xhigh|max`, so
+  card-set defaults and manual `xhigh` tuning are legal.
 
 - **Existing model entries are preserved verbatim** — manual tuning like
   `display_name`, `reasoning_effort`, or capabilities LiteLLM can't report
