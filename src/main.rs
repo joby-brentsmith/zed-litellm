@@ -66,8 +66,13 @@ struct Args {
     #[arg(long)]
     probe: bool,
 
-    /// reasoning_effort assigned to models that report supports_reasoning
-    #[arg(long, default_value = "medium")]
+    /// reasoning_effort assigned to models that report supports_reasoning.
+    /// A card-set `default_reasoning_effort` (agreed across deployments)
+    /// wins over this. Default `high` because on llaminar's GLM/Qwen SGLang
+    /// rigs only `low` and `high` are faithful effort tiers — `medium`
+    /// silently coerces to maximum reasoning burn, making it the worst
+    /// possible default for the fleet this tool runs against.
+    #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
     /// Send a 1-token chat completion to each discovered chat model and report
@@ -77,6 +82,14 @@ struct Args {
     /// models are still synced (you decide whether to remove them).
     #[arg(long)]
     check_liveness: bool,
+
+    /// Skip discovered models whose name contains any of these substrings
+    /// (repeatable). Only applies to newly discovered entries; preserved
+    /// existing entries are never filtered. On llaminar, use this for
+    /// internal capacity a broad (admin) key can see but that shouldn't land
+    /// in the picker: --exclude baseten --exclude auto --exclude upg-test.
+    #[arg(long = "exclude", value_name = "SUBSTRING")]
+    excludes: Vec<String>,
 
     /// Full sync: shorthand for --write --replace --probe --check-liveness.
     /// Regenerates every model entry from /model/info, probes reasoning models
@@ -115,6 +128,7 @@ struct ModelInfo {
     supports_vision: Option<bool>,
     supports_prompt_caching: Option<bool>,
     supports_reasoning: Option<bool>,
+    default_reasoning_effort: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -130,7 +144,13 @@ fn main() -> Result<()> {
     let base_url = normalize_base_url(&args.url);
     let api_url = format!("{base_url}/v1");
 
-    let entries = fetch_model_info(&base_url, args.api_key.as_deref())?;
+    let raw_entries = fetch_model_info(&base_url, args.api_key.as_deref())?;
+    // /model/info reports one entry per deployment; a public model name can
+    // fan out to several (llaminar wildcard aliases). Merge same-name entries
+    // into one conservative card — 3-valued AND on capabilities, min across
+    // reporters for token limits — per the semantics established by
+    // joby-software/vscode-llaminar#61 (PR #63).
+    let entries = merge_deployments(&raw_entries);
 
     // Warn about null capability fields on the gateway cards — the recurring
     // bug class where sbatch register payloads omit the fields so /model/info
@@ -155,7 +175,11 @@ fn main() -> Result<()> {
     } else {
         Vec::new()
     };
-    let discovered = to_zed_models(&entries, &interleaved, &args.reasoning_effort);
+    let mut discovered = to_zed_models(&entries, &interleaved, &args.reasoning_effort);
+    let excluded = exclude_discovered(&mut discovered, &args.excludes);
+    if excluded > 0 {
+        eprintln!("Excluded {excluded} discovered model(s) matching the --exclude patterns");
+    }
     if discovered.is_empty() {
         bail!("no chat models returned by {base_url}/model/info");
     }
@@ -245,13 +269,155 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
     if let Some(api_key) = api_key {
         request = request.set("Authorization", &format!("Bearer {api_key}"));
     }
-    let response = request
-        .call()
-        .with_context(|| format!("requesting {url}"))?;
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, _)) if status == 401 || status == 403 => {
+            // llaminar: keys without /model/info access get 401/403 here. The
+            // client-visible symptom is placeholder token limits; the fix is
+            // a key with access (mint one in the gateway key UI), not
+            // hand-editing Zed settings.
+            bail!(
+                "requesting {url}: HTTP {status} — this key is not allowed to \
+                 call /model/info. Mint a key with /model/info access (on llaminar: \
+                 the key UI at https://llaminar.joby.aero/ui/?page=api-keys) and retry."
+            );
+        }
+        Err(error) => return Err(error).with_context(|| format!("requesting {url}")),
+    };
     let parsed: ModelInfoResponse = response
         .into_json()
         .with_context(|| format!("parsing response from {url}"))?;
     Ok(parsed.data)
+}
+
+/// Merges per-deployment `/model/info` entries that share a `model_name`
+/// into one conservative card. The gateway reports one entry per deployment
+/// and a public model name can fan out to several; first-wins dedupe would
+/// let entry ordering decide capabilities, so instead (the semantics
+/// established for the same endpoint in joby-software/vscode-llaminar#61 / PR
+/// #63):
+///   - capability booleans: any-false → false, all-true → true, else null
+///     (unknown — null warnings fire downstream)
+///   - token limits: min across the deployments that report them
+///   - mode: the common mode when all entries agree; a mix that includes a
+///     non-chat mode reports that non-chat mode (the group is excluded as
+///     non-chat downstream); a chat/responses mix reports "chat"
+///   - default_reasoning_effort: honored only when all deployments agree
+fn merge_deployments(entries: &[ModelEntry]) -> Vec<ModelEntry> {
+    let mut by_name: std::collections::BTreeMap<String, Vec<&ModelEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        if let Some(name) = entry.model_name.as_deref() {
+            by_name.entry(name.to_string()).or_default().push(entry);
+        }
+    }
+    by_name
+        .into_iter()
+        .map(|(name, group)| ModelEntry {
+            model_name: Some(name),
+            model_info: Some(merge_infos(&group)),
+        })
+ .collect()
+}
+
+fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
+    let infos: Vec<ModelInfo> = group
+        .iter()
+        .map(|e| e.model_info.clone().unwrap_or_default())
+        .collect();
+
+    fn and(values: Vec<Option<bool>>) -> Option<bool> {
+        if values.iter().any(|value| *value == Some(false)) {
+            Some(false)
+        } else if values.iter().all(|value| *value == Some(true)) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    fn min_of(values: Vec<Option<f64>>) -> Option<f64> {
+        values.into_iter().flatten().reduce(f64::min)
+    }
+
+    fn agree(values: Vec<Option<String>>) -> Option<String> {
+        let known: Vec<String> = values.into_iter().flatten().collect();
+        let Some(first) = known.first() else {
+            return None;
+        };
+        known.iter().all(|v| v == first).then(|| first.clone())
+    }
+
+    let mode = {
+        let mut distinct: Vec<&str> = infos
+            .iter()
+            .filter_map(|info| info.mode.as_deref())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        match distinct.as_slice() {
+            [] => None,
+            [single] => Some((*single).to_string()),
+            many => match many
+                .iter()
+                .copied()
+                .find(|m| *m != "chat" && *m != "responses")
+            {
+                // A group mixing in a non-chat mode (e.g. embedding) is
+                // reported as non-chat so it's excluded downstream.
+                Some(non_chat) => Some(non_chat.to_string()),
+                // A chat/responses mix routes via chat.
+                None => Some("chat".to_string()),
+            },
+        }
+    };
+
+    ModelInfo {
+        mode,
+        // Fold the per-entry window (max_input_tokens, falling back to
+        // max_tokens) into one min-across-reporters max_input_tokens.
+        max_input_tokens: min_of(
+            infos
+                .iter()
+                .map(|info| info.max_input_tokens.or(info.max_tokens))
+                .collect(),
+        ),
+        max_tokens: None,
+        max_output_tokens: min_of(infos.iter().map(|info| info.max_output_tokens).collect()),
+        supports_function_calling: and(
+            infos
+                .iter()
+                .map(|info| info.supports_function_calling)
+                .collect(),
+        ),
+        supports_parallel_function_calling: and(
+            infos
+                .iter()
+                .map(|info| info.supports_parallel_function_calling)
+                .collect(),
+        ),
+        supports_vision: and(
+            infos.iter().map(|info| info.supports_vision).collect(),
+        ),
+        supports_prompt_caching: and(
+            infos
+                .iter()
+                .map(|info| info.supports_prompt_caching)
+                .collect(),
+        ),
+        supports_reasoning: and(
+            infos
+                .iter()
+                .map(|info| info.supports_reasoning)
+                .collect(),
+        ),
+        default_reasoning_effort: agree(
+            infos
+                .iter()
+                .map(|info| info.default_reasoning_effort.clone())
+                .collect(),
+        ),
+    }
 }
 
 /// Probes reasoning-capable models for `interleaved_reasoning` support by
@@ -301,13 +467,17 @@ fn probe_interleaved_reasoning(
 
 fn probe_one_model(api_url: &str, model_name: &str, api_key: Option<&str>) -> Result<bool> {
     let url = format!("{api_url}/chat/completions");
-    // `reasoning_effort: medium` to actually trigger a reasoning turn;
-    // `max_tokens: 1` to keep cost near zero. We only need a response
-    // message shape, not real output.
+    // `reasoning_effort: "high"` to nudge the model into a reasoning turn
+    // (the always-on GLM/Qwen family thinks regardless — on those rigs
+    // `medium` silently coerces to maximum burn, so `high` is the
+    // predictable faithful tier); `max_tokens: 1` keeps cost near zero.
+    // On reasoning models the single completion token goes to
+    // reasoning_content, which is the signal we need — no real output
+    // required.
     let payload = json!({
         "model": model_name,
         "max_tokens": 1,
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "reasoning_content": "prior thinking", "content": "ok"},
@@ -552,14 +722,30 @@ fn to_zed_models(
         // client fills the window). Emit a sane cap instead: honor a card
         // value only when it's a deliberate sub-window cap; otherwise fall
         // back to DEFAULT_OUTPUT_TOKENS, clamped to the context window.
-        let max_output_tokens = match info.max_output_tokens {
+        let mut max_output_tokens = match info.max_output_tokens {
             Some(cap) if (cap as u64) > 0 && (cap as u64) < max_tokens => cap as u64,
             _ => DEFAULT_OUTPUT_TOKENS.min(max_tokens),
         };
+        // Never emit max_output_tokens == the context window: a request
+        // capped at the full advertised window leaves no room for input, and
+        // llaminar's GLM 5.3 family answers those with a collapsed ~1-token
+        // budget — HTTP 200, zero text — instead of an error
+        // (joby-software/llaminar#94, vscode-llaminar#49).
+        if max_output_tokens == max_tokens {
+            let reserve = (max_tokens / 8).max(4_096).min(max_tokens / 2);
+            max_output_tokens = max_tokens - reserve;
+        }
         model.insert("max_output_tokens".into(), json!(max_output_tokens));
 
         if info.supports_reasoning == Some(true) {
-            model.insert("reasoning_effort".into(), json!(reasoning_effort));
+            // A card-set default_reasoning_effort (operator-curated, agreed
+            // across deployments) wins over the CLI value; the CLI value is
+            // the fallback.
+            let effort = info
+                .default_reasoning_effort
+                .clone()
+                .unwrap_or_else(|| reasoning_effort.to_string());
+            model.insert("reasoning_effort".into(), json!(effort));
         }
         let mut caps = serde_json::Map::new();
         caps.insert(
@@ -599,6 +785,23 @@ fn to_zed_models(
     }
 
     by_name.into_values().collect()
+}
+
+/// Removes discovered models whose name contains any of the given
+/// substrings. Returns how many were removed. Substring (not regex) by
+/// design: on llaminar the internal-capacity tell is a suffix/prefix
+/// (baseten twins, the `auto` router alias, upgrade-test cards), and a
+/// typo'd regex silently filtering a picker is worse than a blunt match.
+fn exclude_discovered(models: &mut Vec<Value>, patterns: &[String]) -> usize {
+    if patterns.is_empty() {
+        return 0;
+    }
+    let before = models.len();
+    models.retain(|model| {
+        let name = model.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        !patterns.iter().any(|pattern| name.contains(pattern))
+    });
+    before - models.len()
 }
 
 /// Reads the provider's current `available_models` entries from the settings
@@ -722,6 +925,181 @@ mod tests {
             model_name: Some(name.to_string()),
             model_info: Some(info),
         }
+    }
+
+    #[test]
+    fn exclude_discovered_filters_substring_matches() {
+        let mut models = vec![
+            json!({"name": "glm-5.3"}),
+            json!({"name": "baseten/muse-spark-open"}),
+            json!({"name": "glm-5.3-baseten"}),
+            json!({"name": "auto"}),
+        ];
+        let excludes = vec!["baseten".to_string(), "auto".to_string()];
+        let removed = exclude_discovered(&mut models, &excludes);
+        assert_eq!(removed, 3);
+        assert_eq!(models[0]["name"], json!("glm-5.3"));
+        // No patterns -> no filtering.
+        assert_eq!(exclude_discovered(&mut models, &[]), 0);
+    }
+
+    #[test]
+    fn merge_deployments_ands_capabilities_and_mins_limits() {
+        // Two deployments of the same public name (a wildcard alias fanning
+        // out to per-backend cards). First-wins would keep whichever entry
+        // came first; the conservative merge keeps the narrower truth:
+        // any-false -> false, all-true -> true, mixed true/null -> null,
+        // token limits min across reporters (vscode-llaminar#61 / PR #63).
+        let entries = vec![
+            entry(
+                "glm-5.3-alias",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    max_input_tokens: Some(1_048_576.0),
+                    max_output_tokens: Some(1_048_576.0),
+                    supports_function_calling: Some(true),
+                    supports_vision: Some(true),
+                    supports_reasoning: Some(true),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "glm-5.3-alias",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    max_input_tokens: Some(262_144.0),
+                    max_output_tokens: Some(262_144.0),
+                    supports_function_calling: Some(true),
+                    supports_vision: Some(false), // spillover twin: no vision
+                    supports_reasoning: None,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let merged = merge_deployments(&entries);
+        assert_eq!(merged.len(), 1);
+        let info = merged[0].model_info.as_ref().unwrap();
+        assert_eq!(info.max_input_tokens, Some(262_144.0), "min across reporters");
+        assert_eq!(info.max_output_tokens, Some(262_144.0));
+        assert_eq!(info.supports_function_calling, Some(true));
+        assert_eq!(info.supports_vision, Some(false), "any-false wins");
+        assert_eq!(info.supports_reasoning, None, "true + null -> null (warns)");
+        assert_eq!(info.mode.as_deref(), Some("chat"));
+
+        // And the emitted entry carries the narrowed limit.
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["max_tokens"], json!(262_144));
+    }
+
+    #[test]
+    fn merge_deployments_excludes_groups_with_non_chat_modes() {
+        let entries = vec![
+            entry(
+                "mixed-mode-alias",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "mixed-mode-alias",
+                ModelInfo {
+                    mode: Some("embedding".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().mode.as_deref(),
+            Some("embedding"),
+            "a non-chat member makes the whole group non-chat"
+        );
+        assert!(to_zed_models(&merged, &[], "high").is_empty());
+    }
+
+    #[test]
+    fn merge_deployments_folds_max_tokens_into_window() {
+        // Old-style cards report `max_tokens` instead of `max_input_tokens`;
+        // the merge must still take the min window across reporters.
+        let entries = vec![
+            entry(
+                "legacy-card",
+                ModelInfo {
+                    max_tokens: Some(512_000.0),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "legacy-card",
+                ModelInfo {
+                    max_input_tokens: Some(256_000.0),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        let info = merged[0].model_info.as_ref().unwrap();
+        assert_eq!(info.max_input_tokens, Some(256_000.0));
+        assert_eq!(info.max_tokens, None, "folded into max_input_tokens");
+    }
+
+    #[test]
+    fn card_default_reasoning_effort_wins_over_cli_fallback() {
+        let entries = vec![entry(
+            "glm-5.3",
+            ModelInfo {
+                supports_reasoning: Some(true),
+                default_reasoning_effort: Some("low".to_string()),
+                ..Default::default()
+            },
+        )];
+
+        // Card default wins regardless of the CLI value.
+        let models = to_zed_models(&entries, &[], "high");
+        assert_eq!(models[0]["reasoning_effort"], json!("low"));
+
+        // Without a card default, the CLI fallback applies.
+        let entries = vec![entry(
+            "kimi-k3",
+            ModelInfo {
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+        let models = to_zed_models(&entries, &[], "high");
+        assert_eq!(models[0]["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn merge_deployments_default_effort_needs_agreement() {
+        let entries = vec![
+            entry(
+                "split-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    default_reasoning_effort: Some("low".to_string()),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "split-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    default_reasoning_effort: Some("high".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        // Deployments disagree -> no card default, CLI fallback applies.
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().default_reasoning_effort,
+            None
+        );
+        let models = to_zed_models(&merged, &[], "medium");
+        assert_eq!(models[0]["reasoning_effort"], json!("medium"));
     }
 
     #[test]
@@ -869,7 +1247,10 @@ mod tests {
         let m = to_zed_models(&deliberate, &[], "medium");
         assert_eq!(m[0]["max_output_tokens"], json!(32_768));
 
-        // default never exceeds a small context window (e.g. qwen3-vl 32768).
+        // default never exceeds a small context window (e.g. qwen3-vl 32768)
+        // — and crucially it never EQUALS the window: at the advertised edge
+        // llaminar's GLM 5.3 family collapses the budget to ~1 and returns an
+        // empty 200 (llaminar#94), so a reserve slice is left.
         let small_ctx = vec![entry(
             "qwen3-vl",
             ModelInfo {
@@ -877,8 +1258,8 @@ mod tests {
                 ..Default::default()
             },
         )];
-        let m = to_zed_models(&small_ctx, &[], "medium");
-        assert_eq!(m[0]["max_output_tokens"], json!(32_768));
+        let m = to_zed_models(&small_ctx, &[], "high");
+        assert_eq!(m[0]["max_output_tokens"], json!(32_768 - 4_096));
     }
 
     #[test]

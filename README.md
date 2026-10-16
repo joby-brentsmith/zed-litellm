@@ -58,7 +58,8 @@ Options:
 | `--write` | off | Modify the file (default is dry-run to stdout) |
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
 | `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model). Only affects newly-discovered models unless `--replace` is also used |
-| `--reasoning-effort` | `medium` | Effort assigned to models with `supports_reasoning` |
+| `--reasoning-effort` | `high` | Effort assigned to reasoning-capable models without a card-set `default_reasoning_effort`. Default `high` because llaminar's GLM/Qwen SGLang rigs only treat `low`/`high` as faithful tiers — `medium` silently coerces to maximum reasoning burn |
+| `--exclude` | off | Skip discovered models whose name contains any given substring (repeatable). For internal capacity a broad key can see but shouldn't land in a picker (llaminar: `--exclude baseten --exclude auto --exclude upg-test`) |
 | `--check-liveness` | off | Send a 1-token completion to each discovered chat model and report which are live vs returning an HTTP error (catches stale aliases / dead backends after a cutover). Report-only — dead models are still synced |
 | `-f`, `--full` | off | Shorthand for `--write --replace --probe --check-liveness` — the one-shot "make my Zed config accurate" sync. Regenerates every model entry from `/model/info`, probes reasoning models for interleaved_reasoning, checks liveness, and writes the result |
 
@@ -68,16 +69,16 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` | a sane cap — LiteLLM's value is unreliable (often equal to the context window — the impossible `out==in` value), so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped to the context window |
+| `max_output_tokens` | a sane cap — LiteLLM's value is unreliable (often equal to the context window — the impossible `out==in` value), so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped just *below* the context window (a cap exactly at the advertised window is the llaminar empty-generation class: the backend collapses the budget to ~1 and returns an empty 200 — joby-software/llaminar#94) |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
 | `supports_prompt_caching` (default false) | `capabilities.prompt_cache_key` |
-| `supports_reasoning` | `reasoning_effort` (value from `--reasoning-effort`) |
+| `supports_reasoning` | `reasoning_effort` — the card's `default_reasoning_effort` (when all deployments agree) wins; otherwise the `--reasoning-effort` value |
 | `interleaved_reasoning` (probed) | `capabilities.interleaved_reasoning` — only when `--probe` confirms the model both accepts and emits `reasoning_content` |
 
 Non-chat models (`mode` of `embedding`, `image_generation`, ...) are skipped,
-and duplicate deployments of the same `model_name` are collapsed.
+and duplicate deployments of the same `model_name` are merged into one conservative card per the semantics established for the same endpoint in vscode-llaminar ([joby-software/vscode-llaminar#61](https://github.com/joby-software/vscode-llaminar/issues/61), [PR #63](https://github.com/joby-software/vscode-llaminar/pull/63)): capability booleans are AND-merged (any-false → false, all-true → true, else unknown→default-with-warning), and token limits are the minimum across the reporting deployments. First-wins dedupe would let entry ordering decide your model picker.
 
 `interleaved_reasoning` defaults to `false` because LiteLLM's `/model/info`
 cannot report it. Pass `--probe` to send a minimal test request to each
@@ -88,6 +89,30 @@ probe adds one near-zero-cost chat-completions call (`max_tokens: 1`) per
 reasoning model, so it's opt-in.
 
 ## Notes
+
+### Known llaminar (moose gateway) facts encoded here
+
+These are live-verified behaviors of Joby's llaminar gateway
+(`llaminar.joby.aero`, LiteLLM ~1.102 on moose k3s):
+
+- **`/model/info` requires key access.** A key without it gets 401/403; the
+  tool exits with a hint pointing at the gateway key UI. The downstream
+  client symptom of an access-less key is “placeholder token limits.”
+- **The v-less `/model/info` is the picker-safe list.** It returns the
+  team-accessible cards and already excludes internal failover capacity
+  (the DB-only Baseten twins have no team access). `/v2/model/info` returns
+  *all* cards, including internal ones — don't point bulk syncs there. A
+  team-scoped virtual key is the intended credential; an admin key sees
+  extras (e.g. `baseten/muse-spark-open`), so pass `--exclude baseten` (and
+  `auto`/`upg-test-*` if visible) on admin-key runs.
+- **Effort ladder on the GLM/Qwen SGLang rigs:** only `low` and `high` are
+  faithful; `medium` silently coerces to maximum burn (gateway-side ladder
+  rewrite pending deploy). Hence the `high` default and the card-
+  `default_reasoning_effort` override — card defaults are operator-curated
+  and always win.
+- **`max_output_tokens == window` is a real failure mode** on the GLM 5.3
+  family — the empty-200 budget collapse ([llaminar#94](https://github.com/joby-software/llaminar/issues/94)) — so generated caps
+  always leave reserve headroom below the advertised window.
 
 - **Existing model entries are preserved verbatim** — manual tuning like
   `display_name`, `reasoning_effort`, or capabilities LiteLLM can't report
