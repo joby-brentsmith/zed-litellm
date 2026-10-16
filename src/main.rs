@@ -34,7 +34,10 @@ struct Args {
     #[arg(long, env = "LITELLM_URL")]
     url: String,
 
-    /// API key for the proxy; must be allowed to call /model/info
+    /// API key for the proxy. /model/info is authenticated but not
+    /// access-gated — the key's scope (team/model list) determines which
+    /// cards are visible, so pick a key whose scope covers the models you
+    /// want in your picker.
     #[arg(long, env = "LITELLM_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
@@ -151,6 +154,14 @@ fn main() -> Result<()> {
     let api_url = format!("{base_url}/v1");
 
     let raw_entries = fetch_model_info(&base_url, args.api_key.as_deref())?;
+    if raw_entries.is_empty() {
+        eprintln!("note: the gateway returned zero cards. /model/info is not");
+        eprintln!("  access-gated — it returns the cards in your key's scope, so this");
+        eprintln!("  usually means the key has no team/model list covering any models");
+        eprintln!("  (client symptom: placeholder token limits). Mint a team-scoped");
+        eprintln!("  key in the gateway key UI and retry.");
+        eprintln!();
+    }
     // /model/info reports one entry per deployment; a public model name can
     // fan out to several (llaminar wildcard aliases). Merge same-name entries
     // into one conservative card — 3-valued AND on capabilities, min across
@@ -294,16 +305,16 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
     let response = match request.call() {
         Ok(response) => response,
         Err(ureq::Error::Status(status, _)) if status == 401 || status == 403 => {
-            // Keys without /model/info access get 401/403 here (the
-            // client-visible symptom is placeholder token limits; the fix
-            // is a key with access, minted in the gateway's key UI — not
-            // hand-editing Zed settings).
+            // /model/info itself has no per-key access gate — a key whose
+            // scope lacks cards gets a 200 with fewer/zero entries, so a
+            // 401/403 here is authentication (invalid/expired key) or a
+            // route-level rejection, not missing /model/info "permission".
             let key_note = if api_key.is_some() {
-                "the key you passed is not allowed to call /model/info"
+                "the gateway rejected the key (invalid or expired)"
             } else {
-                "no API key was provided — /model/info requires a key with access"
+                "no API key was provided — /model/info requires authentication"
             };
-            bail!("requesting {url}: HTTP {status} — {key_note}. On llaminar, mint a team-scoped key with /model/info access in the gateway key UI and retry.");
+            bail!("requesting {url}: HTTP {status} — {key_note}. Note: /model/info is not access-gated beyond authentication; a key whose scope has no cards gets an empty 200, not an error.");
         }
         Err(error) => return Err(error).with_context(|| format!("requesting {url}")),
     };

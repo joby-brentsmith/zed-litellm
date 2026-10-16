@@ -14,7 +14,8 @@ and writes accurate model entries into your Zed settings.
 
 - A running [LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy) with
   `/model/info` accessible (any LiteLLM deployment exposes this)
-- An API key with access to `/model/info`
+- An API key — `/model/info` is authenticated but not access-gated; the
+  key's **scope** (team/model list) determines which cards are visible
 - [Zed](https://zed.dev) installed
 
 ## Install
@@ -52,7 +53,7 @@ Options:
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--url` | `$LITELLM_URL` | LiteLLM proxy base URL; `/v1` suffix ok |
-| `--api-key` | `$LITELLM_API_KEY` | Key with access to `/model/info` |
+| `--api-key` | `$LITELLM_API_KEY` | Gateway key — its scope (team/model list) determines which cards `/model/info` returns |
 | `--provider` | `litellm` | Provider id under `language_models.openai_compatible` |
 | `--settings` | `~/.config/zed/settings.json` | Zed settings file to update |
 | `--write` | off | Modify the file (default is dry-run to stdout) |
@@ -94,21 +95,25 @@ reasoning model, so it's opt-in.
 ### Known llaminar (moose gateway) facts encoded here
 
 These are live-verified behaviors of Joby's llaminar gateway
-(`llaminar.joby.aero`, LiteLLM ~1.102 on moose k3s):
+(`llaminar.joby.aero`, LiteLLM 1.102.1 on moose k3s):
 
-- **`/model/info` requires key access.** A key without it gets 401/403; the
-  tool exits with a hint pointing at the gateway key UI. The downstream
-  client symptom of an access-less key is “placeholder token limits.”
-- **The v-less `/model/info` excludes *some* internal capacity — not all.**
-  Live 2026-10-16: v-less returns 20 cards vs `/v2`'s 24; the delta is exactly
-  the four DB-only GLM/Baseten HA twins (`glm-5.3-baseten`,
-  `glm-5.3-flash-baseten`, `baseten/glm-5.3`, `baseten/glm-5.3-flash`). But
-  other internal cards (`baseten/muse-spark-open`,
-  `deepseek-v4.1-flash-baseten`) *do* appear in v-less for broad keys;
-  team-accessible ≠ picker-clean. Pair broad-key syncs with
-  `--exclude baseten` (and `auto`/`upg-test-*` if visible) — the filter is
-  substring, so check a dry run first. `/v2/model/info` returns all cards
-  including internals — don't point bulk syncs there.
+- **`/model/info` is authenticated but NOT access-gated** (live-verified on
+  moose: the route is an info-route with no role gate, and it responds with
+  the cards in your **key's scope**). A 200 with an empty or partial list
+  means your key's team/model list has no matching cards — the client-visible
+  symptom is placeholder token limits. 401/403 means the key itself was
+  rejected (invalid/expired), not missing "permission" for the route.
+- **The v-less `/model/info` is the caller's allowlist view; `/v2/model/info`
+  is every card.** The difference is the caller's scope, not card fields
+  (live-verified: the config-file master key gets the identical 24 from both;
+  a team or virtual key gets its team's model list). The four DB-only
+  GLM/Baseten HA twins (`glm-[5.3,5.3-flash]-baseten`, `baseten/glm-*`) sit
+  on **no** team allowlist by design (DOPS-14376), so no virtual key sees
+  them via v-less. Other internal cards *do* appear for scoped keys
+  (`baseten/muse-spark-open` via the R&D grant; `deepseek-v4.1-flash-baseten`
+  is on every team list) — so team-accessible ≠ picker-clean: pair broad-key
+  syncs with `--exclude baseten` (substring — check a dry run first).
+  Quirk: teams with an empty `models` list are unscoped and see all 24.
 - **Effort ladders are per-rig, not fleet-wide (llaminar #113):** GLM rigs
   treat only `low`/`high` as faithful, and since the gateway-side ladder hook
   deployed (llaminar #114, operator GO 2026-10-13), a GLM `medium` is
