@@ -126,6 +126,9 @@ These are live-verified behaviors of Joby's llaminar gateway
   thinking *off*, so a Zed-sent effort string is inert there today. Hence the
   `high` default (right for GLM, inert for qwen) and the card-
   `default_reasoning_effort` override — the operator-side per-card remedy
+  (**effective only when `supports_reasoning` resolves to true** — it is not
+  an escape hatch for a null `supports_reasoning`, which stays a
+  fix-the-card issue and warns at runtime)
   (no live card sets it yet; on this fleet it's forward-compat, but it wins
   whenever set). If ops ever flips qwen thinking on, they must set
   `default_reasoning_effort` on those cards — this tool already honors it.
@@ -136,7 +139,9 @@ These are live-verified behaviors of Joby's llaminar gateway
   class is real but its *mechanism* is client-side — the failing requests
   carried client-computed `max_tokens ≈ 1` (a client-estimate collapse, not
   a backend one; Zed sends static caps so it cannot produce that shape).
-  Generated caps are therefore always strictly below the window.
+  Generated caps are therefore always strictly below the window (degenerate
+  one-token windows aside — the code reserves nothing at `max_tokens <= 1`,
+  emitting the unusable window verbatim).
 - **Generated caps are NOT fallback-chain-aware — hand-tune for that.**
   The sync cannot see backend enforcement shapes (fleet operating knowledge
   in llaminar's `docs/post-boot-registration.md`, not card fields): on-prem
