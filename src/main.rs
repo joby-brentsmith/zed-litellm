@@ -183,7 +183,7 @@ fn main() -> Result<()> {
     // Warn about null capability fields on the gateway cards — the recurring
     // bug class where sbatch register payloads omit the fields so /model/info
     // returns null and the sync quietly writes wrong defaults.
-    let null_warnings = warn_null_fields(&entries);
+    let null_warnings = warn_null_fields(&probeable);
     if !null_warnings.is_empty() {
         eprintln!(
             "warning: {} chat model(s) have null capability fields on the gateway;",
@@ -499,7 +499,15 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
         max_input_tokens: min_of(
             infos
                 .iter()
-                .map(|info| info.max_input_tokens.or(info.max_tokens))
+                .map(|info| {
+                    // Filter the unusable zero BEFORE the fallback: Some(0)
+                    // or-valid-max_tokens would otherwise keep the zero,
+                    // which min_of then drops — losing the valid fallback to
+                    // the 128k default (blind-seat catch, 2026-10-16).
+                    info.max_input_tokens
+                        .filter(|v| *v > 0.0)
+                        .or(info.max_tokens)
+                })
                 .collect(),
         ),
         max_tokens: None,
@@ -1414,6 +1422,48 @@ mod tests {
         ];
         let merged = merge_deployments(&entries);
         assert_eq!(merged[0].model_info.as_ref().unwrap().mode, None);
+    }
+
+    #[test]
+    fn merge_deployments_zero_window_falls_back_to_max_tokens() {
+        // A zero max_input_tokens must fall back to the card's valid
+        // max_tokens, not shadow it (Some(0) beats .or() and the zero-cap
+        // filter would then discard the window entirely).
+        // (blind pre-push seat catch on the round-3 fix, 2026-10-16)
+        let entries = vec![entry(
+            "zero-window",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                max_input_tokens: Some(0.0),
+                max_tokens: Some(262_144.0),
+                ..Default::default()
+            },
+        )];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().max_input_tokens,
+            Some(262_144.0)
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["max_tokens"], json!(262_144));
+
+        // Both zero -> unusable -> default window.
+        let entries = vec![entry(
+            "zero-window",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                max_input_tokens: Some(0.0),
+                max_tokens: Some(0.0),
+                ..Default::default()
+            },
+        )];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().max_input_tokens,
+            None
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["max_tokens"], json!(128_000));
     }
 
     #[test]
