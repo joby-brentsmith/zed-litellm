@@ -236,6 +236,12 @@ fn main() -> Result<()> {
                 "No chat models to sync from {base_url}/model/info{excluded_note}; preserving existing entries in {}",
                 args.settings.display()
             );
+            // A true no-op: falling through would still write the file, and
+            // merge_into_settings unconditionally re-points the provider's
+            // api_url — so an empty discovery with a different --url would
+            // silently repoint every preserved model at a gateway that
+            // returned no cards. Return without touching anything.
+            return Ok(());
         } else {
             bail!("no chat models to sync from {base_url}/model/info{excluded_note}");
         }
@@ -271,7 +277,12 @@ fn main() -> Result<()> {
     // empty-discovery decision.
     let settings_text = match fs::read_to_string(&args.settings) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => settings_text,
+        // File gone since the early read (e.g. deleted while the probe /
+        // liveness passes ran): start from an empty document, as the
+        // original single-read path did — writing back the stale snapshot
+        // would recreate a file the user deleted, with settings they
+        // removed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".to_string(),
         Err(error) => {
             return Err(error).with_context(|| format!("reading {}", args.settings.display()));
         }
@@ -411,7 +422,16 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
     }
 
     fn min_of(values: Vec<Option<f64>>) -> Option<f64> {
-        values.into_iter().flatten().reduce(f64::min)
+        // Non-positive caps are unusable metadata (a null-card sibling of the
+        // sbatch omission class), not real limits — dropping them before the
+        // min matches the emitter's positive-cap check. Taking them at face
+        // value would merge [8192, 0] to 0, which the emitter rejects via
+        // the default 65536 fallback — silently exceeding the honest 8192 cap.
+        values
+            .into_iter()
+            .flatten()
+            .filter(|v| *v > 0.0)
+            .reduce(f64::min)
     }
 
     fn agree(values: Vec<Option<String>>) -> Option<String> {
@@ -1394,6 +1414,40 @@ mod tests {
         ];
         let merged = merge_deployments(&entries);
         assert_eq!(merged[0].model_info.as_ref().unwrap().mode, None);
+    }
+
+    #[test]
+    fn merge_deployments_ignores_non_positive_limits() {
+        // A 0 cap is unusable metadata (a "null" sibling), not a real
+        // limit: min([8192, 0]) == 0 would be rejected by the emitter in
+        // favor of the 65,536 default — silently exceeding the honest
+        // 8192 cap (regression for the Copilot PR-15 round-3 finding).
+        let entries = vec![
+            entry(
+                "zero-capped",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    max_input_tokens: Some(262_144.0),
+                    max_output_tokens: Some(8_192.0),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "zero-capped",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    max_input_tokens: Some(262_144.0),
+                    max_output_tokens: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        let info = merged[0].model_info.as_ref().unwrap();
+        assert_eq!(info.max_output_tokens, Some(8_192.0), "0 ignored, not min");
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["max_output_tokens"], json!(8_192));
+        assert_eq!(models[0]["max_tokens"], json!(262_144));
     }
 
     #[test]
