@@ -15,10 +15,10 @@ const DEFAULT_MAX_TOKENS: u64 = 128_000;
 
 /// Safe per-response output cap when the LiteLLM card's `max_output_tokens`
 /// is missing or unreliable. LiteLLM frequently reports `max_output_tokens`
-/// equal to the context window — the impossible `out==in` value that leaves
-/// no room for input and trips `input + max_tokens > context` 400s when a
-/// client fills the window. This default is generous for normal coding
-/// responses and is always clamped to the context window at emit time.
+/// equal to the context window — on llaminar that's the deliberate card
+/// clamp shape, not rot — so a sub-window cap is emitted instead, always
+/// strictly below the context window (see to_zed_models) so prompt-full
+/// requests can never trip the gateway/sum gates at the window edge.
 const DEFAULT_OUTPUT_TOKENS: u64 = 65_536;
 
 /// Sync models from a LiteLLM proxy into Zed's settings.
@@ -68,10 +68,16 @@ struct Args {
 
     /// reasoning_effort assigned to models that report supports_reasoning.
     /// A card-set `default_reasoning_effort` (agreed across deployments)
-    /// wins over this. Default `high` because on llaminar's GLM/Qwen SGLang
-    /// rigs only `low` and `high` are faithful effort tiers — `medium`
-    /// silently coerces to maximum reasoning burn, making it the worst
-    /// possible default for the fleet this tool runs against.
+    /// wins over this — the operator-side per-rig remedy (no live card sets
+    /// it today, 2026-10-16). Default `high` is the right fleet call: on GLM
+    /// rigs `high` is the documented faithful tier (~22% of default burn —
+    /// and since the gateway-side ladder hook deployed (llaminar #114, GO
+    /// 2026-10-13), a GLM `medium` gets translated to `high` anyway); on
+    /// qwen3.8 rigs the tier map is different (xhigh/medium/low — no
+    /// `high`), but their cards bake thinking off so the parameter is
+    /// inert today. If ops ever flips qwen thinking on card-side, they must
+    /// also set `default_reasoning_effort` on those cards — a Zed-sent
+    /// `high` would 400 there (llaminar docs/reasoning-effort.md #113).
     #[arg(long, default_value = "high")]
     reasoning_effort: String,
 
@@ -180,8 +186,32 @@ fn main() -> Result<()> {
     if excluded > 0 {
         eprintln!("Excluded {excluded} discovered model(s) matching the --exclude patterns");
     }
+
+    // Read the settings before deciding whether to bail: when preserving
+    // existing entries, an all-excluded (or empty) discovery is not fatal
+    // — the sync becomes a no-op that keeps the preserved entries. Only a
+    // true zero-model outcome bails.
+    let settings_text = match fs::read_to_string(&args.settings) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".to_string(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", args.settings.display()));
+        }
+    };
     if discovered.is_empty() {
-        bail!("no chat models returned by {base_url}/model/info");
+        let excluded_note = if excluded > 0 {
+            " (all discovered models matched the --exclude patterns)"
+        } else {
+            ""
+        };
+        if !args.replace && !existing_models(&settings_text, &args.provider).is_empty() {
+            eprintln!(
+                "No chat models to sync from {base_url}/model/info{excluded_note}; preserving existing entries in {}",
+                args.settings.display()
+            );
+        } else {
+            bail!("no chat models to sync from {base_url}/model/info{excluded_note}");
+        }
     }
 
     // Liveness check: probe each chat model with a 1-token completion to catch
@@ -205,14 +235,6 @@ fn main() -> Result<()> {
         }
         eprintln!();
     }
-
-    let settings_text = match fs::read_to_string(&args.settings) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}\n".to_string(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading {}", args.settings.display()));
-        }
-    };
 
     let models = if replace {
         eprintln!(
@@ -272,15 +294,16 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
     let response = match request.call() {
         Ok(response) => response,
         Err(ureq::Error::Status(status, _)) if status == 401 || status == 403 => {
-            // llaminar: keys without /model/info access get 401/403 here. The
-            // client-visible symptom is placeholder token limits; the fix is
-            // a key with access (mint one in the gateway key UI), not
-            // hand-editing Zed settings.
-            bail!(
-                "requesting {url}: HTTP {status} — this key is not allowed to \
-                 call /model/info. Mint a key with /model/info access (on llaminar: \
-                 the key UI at https://llaminar.joby.aero/ui/?page=api-keys) and retry."
-            );
+            // Keys without /model/info access get 401/403 here (the
+            // client-visible symptom is placeholder token limits; the fix
+            // is a key with access, minted in the gateway's key UI — not
+            // hand-editing Zed settings).
+            let key_note = if api_key.is_some() {
+                "the key you passed is not allowed to call /model/info"
+            } else {
+                "no API key was provided — /model/info requires a key with access"
+            };
+            bail!("requesting {url}: HTTP {status} — {key_note}. On llaminar, mint a team-scoped key with /model/info access in the gateway key UI and retry.");
         }
         Err(error) => return Err(error).with_context(|| format!("requesting {url}")),
     };
@@ -307,6 +330,8 @@ fn merge_deployments(entries: &[ModelEntry]) -> Vec<ModelEntry> {
     let mut by_name: std::collections::BTreeMap<String, Vec<&ModelEntry>> =
         std::collections::BTreeMap::new();
     for entry in entries {
+        // Nameless entries have no stable identity to merge under and are
+        // discarded (same policy as to_zed_models).
         if let Some(name) = entry.model_name.as_deref() {
             by_name.entry(name.to_string()).or_default().push(entry);
         }
@@ -454,13 +479,14 @@ fn probe_interleaved_reasoning(
 
 fn probe_one_model(api_url: &str, model_name: &str, api_key: Option<&str>) -> Result<bool> {
     let url = format!("{api_url}/chat/completions");
-    // `reasoning_effort: "high"` to nudge the model into a reasoning turn
-    // (the always-on GLM/Qwen family thinks regardless — on those rigs
-    // `medium` silently coerces to maximum burn, so `high` is the
-    // predictable faithful tier); `max_tokens: 1` keeps cost near zero.
-    // On reasoning models the single completion token goes to
-    // reasoning_content, which is the signal we need — no real output
-    // required.
+    // `reasoning_effort: "high"`: on the always-on GLM family reasoning
+    // fires regardless of effort strings; on qwen3.8 the card default is
+    // thinking-off, making the parameter inert. `high` is the faithful GLM
+    // tier — and what the deployed ladder hook translates `medium` into
+    // anyway (GLM groups; llaminar #114, GO 2026-10-13). `max_tokens: 1`
+    // keeps cost near zero, and on reasoning models the single completion
+    // token lands in reasoning_content (the signal we need) with no real
+    // output required.
     let payload = json!({
         "model": model_name,
         "max_tokens": 1,
@@ -632,6 +658,11 @@ fn warn_null_fields(entries: &[ModelEntry]) -> Vec<String> {
         if info.supports_reasoning.is_none() {
             gaps.push("supports_reasoning (reasoning_effort omitted — capability loss)");
         }
+        if info.supports_prompt_caching.is_none() {
+            gaps.push(
+                "supports_prompt_caching (prompt_cache_key defaults to false — cache misses)",
+            );
+        }
         if info.max_input_tokens.is_none() && info.max_tokens.is_none() {
             gaps.push("max_input_tokens (defaults to 128000)");
         }
@@ -703,27 +734,27 @@ fn to_zed_models(
             .unwrap_or(DEFAULT_MAX_TOKENS);
         model.insert("max_tokens".into(), json!(max_tokens));
 
-        // LiteLLM's `max_output_tokens` card value can't be trusted as a
-        // Zed side setting: llaminar deliberately clamps every glm-5.3-family
-        // card to 262144/262144 (the 2026-09-22 session — mirrors the Baseten
-        // twins' standalone enforcement), and vanilla LiteLLM deployments
-        // report the impossible out==in shape through card rot. Either way,
-        // emitting out==window into Zed is the llaminar#94 class-A shape:
-        // a window-filling prompt plus a full-window cap collapses the
-        // backend budget to ~1 and returns an empty 200. Emit a sane cap
-        // instead: honor the card value only when it's a deliberate
-        // sub-window cap; otherwise fall back to DEFAULT_OUTPUT_TOKENS,
-        // clamped (with reserve) below the context window.
+        // LiteLLM's `max_output_tokens` card value can't be used directly as
+        // the Zed side setting: llaminar deliberately clamps glm-family
+        // cards to 262144/262144 (the 2026-09-22 session, mirroring the
+        // Baseten twins' standalone enforcement), and other LiteLLM
+        // deployments report the same out==in shape through card rot.
+        // Either way an out==window cap in Zed guarantees prompt+out >
+        // window on every non-empty request — a guaranteed 400 on
+        // sum-gate-checked routes (live-proven on the qwen3.8-27b-onprem
+        // hop). Emit a sane cap instead: honor the card value only when
+        // it's a deliberate sub-window cap; otherwise fall back to
+        // DEFAULT_OUTPUT_TOKENS, strictly below the context window.
         let mut max_output_tokens = match info.max_output_tokens {
             Some(cap) if (cap as u64) > 0 && (cap as u64) < max_tokens => cap as u64,
             _ => DEFAULT_OUTPUT_TOKENS.min(max_tokens),
         };
-        // Never emit max_output_tokens == the context window: a request
-        // capped at the full advertised window leaves no room for input, and
-        // llaminar's GLM 5.3 family answers those with a collapsed ~1-token
-        // budget — HTTP 200, zero text — instead of an error
-        // (joby-software/llaminar#94, vscode-llaminar#49).
-        if max_output_tokens == max_tokens {
+        // Never emit max_output_tokens >= the context window: a request
+        // capped at the advertised window leaves no room for input and is
+        // guaranteed to 400 on summed-gate backends (qwen3.8-27b-onprem:
+        // 262144 out -> 400, 24576 -> 200, live-proven 2026-10-16). For
+        // degenerate windows <= 1 there is nothing to reserve.
+        if max_output_tokens >= max_tokens && max_tokens > 1 {
             let reserve = (max_tokens / 8).max(4_096).min(max_tokens / 2);
             max_output_tokens = max_tokens - reserve;
         }
@@ -786,10 +817,12 @@ fn to_zed_models(
 }
 
 /// Removes discovered models whose name contains any of the given
-/// substrings. Returns how many were removed. Substring (not regex) by
-/// design: on llaminar the internal-capacity tell is a suffix/prefix
-/// (baseten twins, the `auto` router alias, upgrade-test cards), and a
+/// substrings. Returns how many were removed. Substring (not regex, not
+/// exact) by design — the internal-capacity tells are prefixes/suffixes
+/// (`baseten/...`, `...-baseten`) plus the bare `auto` router alias — and a
 /// typo'd regex silently filtering a picker is worse than a blunt match.
+/// NOTE: substring means `--exclude auto` also drops any name *containing*
+/// "auto"; run a dry run to check what matches before `--write`.
 fn exclude_discovered(models: &mut Vec<Value>, patterns: &[String]) -> usize {
     if patterns.is_empty() {
         return 0;
@@ -1214,12 +1247,13 @@ mod tests {
     }
 
     /// The card's `max_output_tokens` is unreliable (frequently equal to
-    /// the context window — the impossible `out==in` value), so the sync must
-    /// substitute a sane cap rather than propagate it or omit the field:
-    ///   - `out==in` card → DEFAULT_OUTPUT_TOKENS, clamped to the context window
+    /// the context window — on llaminar the deliberate clamp shape, elsewhere
+    /// card rot), so the sync must substitute a sane cap rather than
+    /// propagate it or omit the field:
+    ///   - `out==in` card → DEFAULT_OUTPUT_TOKENS, strictly below the window
     ///   - null card      → same fallback
     ///   - a deliberate sub-window cap → honored
-    ///   - default never exceeds a small context window
+    ///   - the emit is always strictly below the context window (w > 1)
     #[test]
     fn emits_safe_max_output_tokens() {
         // out==in (the glm-5.2-1M / kimi-k3-azure bug): fall back to default.
@@ -1260,9 +1294,11 @@ mod tests {
         assert_eq!(m[0]["max_output_tokens"], json!(32_768));
 
         // default never exceeds a small context window (e.g. qwen3-vl 32768)
-        // — and crucially it never EQUALS the window: at the advertised edge
-        // llaminar's GLM 5.3 family collapses the budget to ~1 and returns an
-        // empty 200 (llaminar#94), so a reserve slice is left.
+        // never EQUALS the window: an out==window cap guarantees a 400 on
+        // summed-gate routes (qwen3.8-27b-onprem, live-proven), so a reserve
+        // slice is left. The llaminar#94 empty-200 class was client-side
+        // (clients sending max_tokens ≈ 1 themselves) — this guard is
+        // about the gates.
         let small_ctx = vec![entry(
             "qwen3-vl",
             ModelInfo {
@@ -1272,6 +1308,32 @@ mod tests {
         )];
         let m = to_zed_models(&small_ctx, &[], "high");
         assert_eq!(m[0]["max_output_tokens"], json!(32_768 - 4_096));
+
+        // Pin the reserve arithmetic against the exact misreading a reviewer
+        // made of it (dropping the trailing .min): at window 4096 the reserve
+        // is min(max(512, 4096), 2048) = 2048, NOT 4096 — the emitted cap is
+        // 2048, never 0.
+        let w4096 = vec![entry(
+            "tiny-window",
+            ModelInfo {
+                max_input_tokens: Some(4_096.0),
+                ..Default::default()
+            },
+        )];
+        let m = to_zed_models(&w4096, &[], "high");
+        assert_eq!(m[0]["max_output_tokens"], json!(2_048));
+
+        // Degenerate windows: reserve as much as possible without hitting
+        // zero or underflow.
+        let w2 = vec![entry(
+            "two-token-window",
+            ModelInfo {
+                max_input_tokens: Some(2.0),
+                ..Default::default()
+            },
+        )];
+        let m = to_zed_models(&w2, &[], "high");
+        assert_eq!(m[0]["max_output_tokens"], json!(1));
     }
 
     #[test]
@@ -1522,6 +1584,7 @@ mod tests {
         assert!(warnings[0].contains("supports_function_calling"));
         assert!(warnings[0].contains("supports_vision"));
         assert!(warnings[0].contains("supports_parallel_function_calling"));
+        assert!(warnings[0].contains("supports_prompt_caching"));
         assert!(!warnings[0].contains("supports_reasoning"));
         assert!(!warnings[0].contains("max_input_tokens"));
     }
@@ -1537,6 +1600,7 @@ mod tests {
                 supports_parallel_function_calling: Some(true),
                 supports_vision: Some(false),
                 supports_reasoning: Some(true),
+                supports_prompt_caching: Some(true),
                 ..Default::default()
             },
         )];
@@ -1545,6 +1609,32 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "no warnings when all fields set: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warn_null_fields_reports_null_prompt_caching() {
+        // Merged-unknown supports_prompt_caching silently turns into
+        // prompt_cache_key: false (a real cost on fleets with prompt
+        // caching), so it must be warned like the other capability gaps.
+        let entries = vec![entry(
+            "glm-5.3",
+            ModelInfo {
+                mode: Some("chat".to_string()),
+                max_input_tokens: Some(262_144.0),
+                supports_function_calling: Some(true),
+                supports_parallel_function_calling: Some(true),
+                supports_vision: Some(false),
+                supports_reasoning: Some(true),
+                ..Default::default()
+            },
+        )];
+
+        let warnings = warn_null_fields(&entries);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("supports_prompt_caching"),
+            "a merged-unknown prompt-caching flag must warn: {warnings:?}"
         );
     }
 

@@ -58,7 +58,7 @@ Options:
 | `--write` | off | Modify the file (default is dry-run to stdout) |
 | `--replace` | off | Regenerate all entries instead of preserving existing ones |
 | `--probe` | off | Probe reasoning models for `interleaved_reasoning` support (adds one minimal chat-completions call per reasoning-capable model). Only affects newly-discovered models unless `--replace` is also used |
-| `--reasoning-effort` | `high` | Effort assigned to reasoning-capable models without a card-set `default_reasoning_effort`. Default `high` because llaminar's GLM/Qwen SGLang rigs only treat `low`/`high` as faithful tiers — `medium` silently coerces to maximum reasoning burn |
+| `--reasoning-effort` | `high` | Effort assigned to reasoning-capable models without a card-set `default_reasoning_effort`. Default `high`: the faithful GLM tier (~22% of default burn, and `medium` is ladder-hook-translated to `high` there anyway); inert on qwen3.8 whose cards bake thinking off (see the llaminar notes below for the per-rig ladders) |
 | `--exclude` | off | Skip discovered models whose name contains any given substring (repeatable). For internal capacity a broad key can see but shouldn't land in a picker (llaminar: `--exclude baseten --exclude auto --exclude upg-test`) |
 | `--check-liveness` | off | Send a 1-token completion to each discovered chat model and report which are live vs returning an HTTP error (catches stale aliases / dead backends after a cutover). Report-only — dead models are still synced |
 | `-f`, `--full` | off | Shorthand for `--write --replace --probe --check-liveness` — the one-shot "make my Zed config accurate" sync. Regenerates every model entry from `/model/info`, probes reasoning models for interleaved_reasoning, checks liveness, and writes the result |
@@ -69,7 +69,7 @@ Options:
 | --- | --- |
 | `model_name` | `name` |
 | `max_input_tokens` (fallback `max_tokens`, then 128000) | `max_tokens` |
-| `max_output_tokens` | a sane cap — llaminar deliberately pins glm-family cards to the out==in 262144 shape (the 2026-09-22 clamp, mirroring the Baseten twins), and other LiteLLM deployments report the same shape through card rot. Either way an out==window cap in Zed is the llaminar#94 empty-200 class, so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) clamped just *below* the context window (reserve headroom: at the advertised-window edge the GLM 5.3 family collapses the budget to ~1 and returns an empty 200) |
+| `max_output_tokens` | a sane cap — llaminar deliberately pins glm-family cards to the out==in 262144 shape (the 2026-09-22 clamp, mirroring the Baseten twins), and other LiteLLM deployments report the same shape through card rot. Either way an out==window cap in Zed guarantees a 400 on summed-gate routes, so the tool honors the card value only when it's a deliberate sub-window cap, and otherwise emits `DEFAULT_OUTPUT_TOKENS` (65536) — always **strictly below** the context window (a reserve slice is carved when the fallback would otherwise equal the window) |
 | `supports_function_calling` (default true) | `capabilities.tools` |
 | `supports_vision` (default false) | `capabilities.images` |
 | `supports_parallel_function_calling` (default false) | `capabilities.parallel_tool_calls` |
@@ -79,7 +79,7 @@ Options:
 | (nothing — emitted unconditionally) | `capabilities.max_tokens_parameter: true` — Zed's `openai_compatible` default sends the output cap as `max_completion_tokens`; classic `max_tokens` is what every backend on this fleet accepts (SGLang, vLLM, the Baseten twins), so the classic shape is pinned explicitly. Unknown to older Zed, which ignores it |
 
 Non-chat models (`mode` of `embedding`, `image_generation`, ...) are skipped,
-and duplicate deployments of the same `model_name` are merged into one conservative card per the semantics established for the same endpoint in vscode-llaminar ([joby-software/vscode-llaminar#61](https://github.com/joby-software/vscode-llaminar/issues/61), [PR #63](https://github.com/joby-software/vscode-llaminar/pull/63)): capability booleans are AND-merged (any-false → false, all-true → true, else unknown→default-with-warning), and token limits are the minimum across the reporting deployments. First-wins dedupe would let entry ordering decide your model picker.
+and duplicate deployments of the same `model_name` are merged into one conservative card per the semantics established for the same endpoint in vscode-llaminar ([joby-software/vscode-llaminar#61](https://github.com/joby-software/vscode-llaminar/issues/61), [PR #63](https://github.com/joby-software/vscode-llaminar/pull/63)): capability booleans are AND-merged (any-false → false, all-true → true, else unknown), token limits are the minimum across the reporting deployments, and `default_reasoning_effort` is honored only when all deployments agree. Note the one visible consequence of the AND-merge: a deployment group with mixed `supports_reasoning` (true + null) merges to *unknown*, which omits `reasoning_effort` (with a null-field warning) rather than guessing — first-wins dedupe would have kept whichever entry came first.
 
 `interleaved_reasoning` defaults to `false` because LiteLLM's `/model/info`
 cannot report it. Pass `--probe` to send a minimal test request to each
@@ -99,41 +99,63 @@ These are live-verified behaviors of Joby's llaminar gateway
 - **`/model/info` requires key access.** A key without it gets 401/403; the
   tool exits with a hint pointing at the gateway key UI. The downstream
   client symptom of an access-less key is “placeholder token limits.”
-- **The v-less `/model/info` is the picker-safe list.** It returns the
-  team-accessible cards and already excludes internal failover capacity
-  (the DB-only Baseten twins have no team access). `/v2/model/info` returns
-  *all* cards, including internal ones — don't point bulk syncs there. A
-  team-scoped virtual key is the intended credential; an admin key sees
-  extras (e.g. `baseten/muse-spark-open`), so pass `--exclude baseten` (and
-  `auto`/`upg-test-*` if visible) on admin-key runs.
-- **Effort ladder on the GLM/Qwen SGLang rigs:** only `low` and `high` are
-  faithful; `medium` silently coerces to maximum burn (gateway-side ladder
-  rewrite pending deploy). Hence the `high` default and the card-
-  `default_reasoning_effort` override — card defaults are operator-curated
-  and always win.
-- **`max_output_tokens == window` is a real failure mode** on the GLM 5.3
-  family — the empty-200 budget collapse ([llaminar#94](https://github.com/joby-software/llaminar/issues/94)) — so generated caps
-  always leave reserve headroom below the advertised window.
+- **The v-less `/model/info` excludes *some* internal capacity — not all.**
+  Live 2026-10-16: v-less returns 20 cards vs `/v2`'s 24; the delta is exactly
+  the four DB-only GLM/Baseten HA twins (`glm-5.3-baseten`,
+  `glm-5.3-flash-baseten`, `baseten/glm-5.3`, `baseten/glm-5.3-flash`). But
+  other internal cards (`baseten/muse-spark-open`,
+  `deepseek-v4.1-flash-baseten`) *do* appear in v-less for broad keys;
+  team-accessible ≠ picker-clean. Pair broad-key syncs with
+  `--exclude baseten` (and `auto`/`upg-test-*` if visible) — the filter is
+  substring, so check a dry run first. `/v2/model/info` returns all cards
+  including internals — don't point bulk syncs there.
+- **Effort ladders are per-rig, not fleet-wide (llaminar #113):** GLM rigs
+  treat only `low`/`high` as faithful, and since the gateway-side ladder hook
+  deployed (llaminar #114, operator GO 2026-10-13), a GLM `medium` is
+  *translated to* `high` rather than riding the max-burn default. qwen3.8
+  rigs are different: their tier map is `xhigh` (default)/`medium`/`low` — no
+  `high` (which 400s in the thinking-on regime) — but their cards bake
+  thinking *off*, so a Zed-sent effort string is inert there today. Hence the
+  `high` default (right for GLM, inert for qwen) and the card-
+  `default_reasoning_effort` override — the operator-side per-card remedy
+  (no live card sets it yet; on this fleet it's forward-compat, but it wins
+  whenever set). If ops ever flips qwen thinking on, they must set
+  `default_reasoning_effort` on those cards — this tool already honors it.
+- **Never cap output at the advertised window.** Two reasons: (a) an
+  out==window cap guarantees `prompt + max_tokens > window` on every
+  non-empty request, and summed-gate backends reject it (live-proven on the
+  qwen3.8-27b-onprem hop: 262144 out → 400); (b) the llaminar#94 empty-200
+  class is real but its *mechanism* is client-side — the failing requests
+  carried client-computed `max_tokens ≈ 1` (a client-estimate collapse, not
+  a backend one; Zed sends static caps so it cannot produce that shape).
+  Generated caps are therefore always strictly below the window.
 - **Generated caps are NOT fallback-chain-aware — hand-tune for that.**
-  The sync cannot see backend enforcement shapes (they're fleet operating
-  knowledge in llaminar's `docs/post-boot-registration.md`, not card fields):
-  on-prem GLM rigs enforce a `prompt + max_tokens ≤ 1,048,576` sum gate, the
-  Baseten twins enforce `max_tokens ≤ 262144` standalone (no sum check),
-  and the qwen twin `qwen3.8-27b-onprem` enforces a strict 262,144 total
-  (live-verified 2026-10-16: 262144 out → 400, 24576 → 200). So for an alias
-  whose `fallback_models` hop has a smaller gate than the primary — e.g.
-  `joby-onprem`, which hops to `qwen3.8-27b-onprem` — a synced 65536 output
-  cap still 400s every *hopped* long-context request. The fix is a
-  hand-tuned preserved entry: with Zed's 90% auto-compaction boundary of a
-  262144 window (~236k), `236k + 24576 = 260.5k ≤ 262144` — cap such aliases'
-  `max_output_tokens` at ~24k (the `/model/info` card's `fallback_models`
-  field at least tells you *which* chains to check).
+  The sync cannot see backend enforcement shapes (fleet operating knowledge
+  in llaminar's `docs/post-boot-registration.md`, not card fields): on-prem
+  GLM rigs enforce a `prompt + max_tokens ≤ 1,048,576` sum gate, the Baseten
+  twins enforce `max_tokens ≤ 262144` standalone (no sum check), and the
+  qwen twin `qwen3.8-27b-onprem` enforces a strict 262,144 total
+  (live-verified 2026-10-16: 262144 out → 400, 24576 → 200). Zed's
+  auto-compaction boundary is `90% × (window − max_output_tokens)` — the
+  output cap is reserved *separately* from the compaction threshold
+  (Zed `crates/agent/src/thread.rs`, `compaction_input_capacity`; test
+  pins 0.9×(1M−32k)=871,200). With the tool's 65536 default on a 262144
+  window: threshold ≈ 176.9k, so a hopped request ≈ 242k ≤ 262,144 — it
+  *fits* under compaction-governed flows. The residual exposure is
+  threshold-overshoot and compaction-off flows, so capping a chained alias
+  like `joby-onprem` (hops to `qwen3.8-27b-onprem`) at ~24k remains sound
+  defense-in-depth: hand-tune the preserved entry. (The card's
+  `fallback_models` field tells you *which* chains to check.)
 - **Zed schema notes (verified against Zed `main` 2026-10-16):** the
   `capabilities` block requires `tools`, `images`, `parallel_tool_calls`,
   and `prompt_cache_key` (no serde defaults — blocks omitting them fail to
   load, the exact regression this tool guards against);
   `reasoning_effort` accepts `none|minimal|low|medium|high|xhigh|max`, so
-  card-set defaults and manual `xhigh` tuning are legal.
+  card-set defaults and manual `xhigh` tuning are legal. Zed's default wire
+  parameter for the output cap is `max_completion_tokens` (`max_tokens_parameter: true`
+  switches to classic `max_tokens`); the gateway accepts both (LiteLLM
+  translates) — the classic pin is defense-in-depth, not a fix for a broken
+  default.
 
 - **Existing model entries are preserved verbatim** — manual tuning like
   `display_name`, `reasoning_effort`, or capabilities LiteLLM can't report
