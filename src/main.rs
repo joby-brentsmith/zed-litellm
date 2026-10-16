@@ -120,7 +120,7 @@ struct ModelInfoResponse {
     data: Vec<ModelEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ModelEntry {
     model_name: Option<String>,
     model_info: Option<ModelInfo>,
@@ -169,6 +169,17 @@ fn main() -> Result<()> {
     // joby-software/vscode-llaminar#61 (PR #63).
     let entries = merge_deployments(&raw_entries);
 
+    // The --exclude patterns decide which models land in the picker; they
+    // must also gate the probe/liveness candidates. Excluded models are
+    // commonly excluded because their backends are unreachable — probing
+    // them is wasted latency (up to the 10s liveness timeout each) on
+    // models that will never be emitted.
+    let probeable: Vec<ModelEntry> = entries
+        .iter()
+        .filter(|entry| !is_excluded(entry.model_name.as_deref().unwrap_or(""), &args.excludes))
+        .cloned()
+        .collect();
+
     // Warn about null capability fields on the gateway cards — the recurring
     // bug class where sbatch register payloads omit the fields so /model/info
     // returns null and the sync quietly writes wrong defaults.
@@ -190,7 +201,7 @@ fn main() -> Result<()> {
         eprintln!("Probing reasoning models for interleaved_reasoning support...");
         probe_interleaved_reasoning(
             &api_url,
-            &entries,
+            &probeable,
             &args.reasoning_effort,
             args.api_key.as_deref(),
         )
@@ -235,7 +246,7 @@ fn main() -> Result<()> {
     // Report-only — dead models are still synced.
     if do_liveness {
         eprintln!("Checking liveness of chat models...");
-        let results = check_liveness(&api_url, &entries, args.api_key.as_deref());
+        let results = check_liveness(&api_url, &probeable, args.api_key.as_deref());
         let dead: Vec<_> = results.iter().filter(|r| !r.live).collect();
         if dead.is_empty() {
             eprintln!("All {} chat model(s) are live.", results.len());
@@ -251,6 +262,20 @@ fn main() -> Result<()> {
         }
         eprintln!();
     }
+
+    // Reload the settings before merging: the probe/liveness passes above
+    // can run for minutes, and Zed saves this file on its own triggers —
+    // merging into the stale pre-probe snapshot would clobber edits saved
+    // in the meantime, including unrelated keys (the whole file is rewritten
+    // from this snapshot). The pre-check read above remains only for the
+    // empty-discovery decision.
+    let settings_text = match fs::read_to_string(&args.settings) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => settings_text,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", args.settings.display()));
+        }
+    };
 
     let models = if replace {
         eprintln!(
@@ -342,7 +367,10 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
 ///     non-chat mode reports that non-chat mode (the group is excluded as
 ///     non-chat downstream); a chat/responses mix reports
 ///     "mixed-chat-responses" and is excluded too (no single API serves
-///     every member of the group)
+///     every member of the group). Unreported (null) modes count as chat
+///     here — exactly as downstream treats them — so a [null, "responses"]
+///     group is excluded as mixed rather than passing as Responses-only;
+///     a group where nothing reports a mode stays null (warns downstream)
 ///   - default_reasoning_effort: honored only when every deployment sets
 ///     the same value; any disagreement or absence falls back to the CLI
 ///     value (one backend's curated default is not stretched onto a
@@ -399,14 +427,24 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
     }
 
     let mode = {
-        let mut distinct: Vec<&str> = infos
+        // A null (unreported) mode counts as chat downstream — to_zed_models
+        // includes null-mode cards as chat — so fold it that way here too,
+        // or a [null, "responses"] group would pass as Responses-only and
+        // emit chat_completions: false for a deployment that is really
+        // chat-capable-but-unlabeled (the recurring sbatch null-metadata
+        // class flagged by the null-field warnings).
+        let mut effective: Vec<&str> = infos
             .iter()
-            .filter_map(|info| info.mode.as_deref())
+            .map(|info| info.mode.as_deref().unwrap_or("chat"))
             .collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        match distinct.as_slice() {
+        effective.sort_unstable();
+        effective.dedup();
+        // No deployment reports a mode at all: stays unknown — the
+        // null-mode warning fires downstream.
+        let no_mode_reported = infos.iter().all(|info| info.mode.is_none());
+        match effective.as_slice() {
             [] => None,
+            _ if no_mode_reported => None,
             [single] => Some((*single).to_string()),
             many => match many
                 .iter()
@@ -549,6 +587,7 @@ fn probe_one_model(
     let body = serde_json::to_string(&payload)?;
 
     let mut request = ureq::post(&url)
+        .timeout(Duration::from_secs(30))
         .set("Content-Type", "application/json")
         .set("Accept", "application/json");
     if let Some(api_key) = api_key {
@@ -879,9 +918,14 @@ fn exclude_discovered(models: &mut Vec<Value>, patterns: &[String]) -> usize {
     let before = models.len();
     models.retain(|model| {
         let name = model.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        !patterns.iter().any(|pattern| name.contains(pattern))
+        !is_excluded(name, patterns)
     });
     before - models.len()
+}
+/// True when `name` contains any of the `--exclude` patterns. See
+/// `exclude_discovered` for why this is substring (not regex, not exact).
+fn is_excluded(name: &str, patterns: &[String]) -> bool {
+    !patterns.is_empty() && patterns.iter().any(|pattern| name.contains(pattern))
 }
 
 /// Reads the provider's current `available_models` entries from the settings
@@ -1278,6 +1322,78 @@ mod tests {
         );
         let models = to_zed_models(&merged, &[], "high");
         assert!(models.is_empty(), "mixed chat/responses group is excluded");
+    }
+
+    #[test]
+    fn merge_deployments_treats_null_mode_as_chat_when_mixed() {
+        // [null, "responses"]: the null-mode deployment is included as chat
+        // downstream, so the group is a mixed-API group — it must be
+        // excluded, not emitted as Responses-only (regression for the
+        // Copilot PR-15 round-2 finding).
+        let entries = vec![
+            entry(
+                "unlabeled-plus-responses",
+                ModelInfo {
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "unlabeled-plus-responses",
+                ModelInfo {
+                    mode: Some("responses".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().mode.as_deref(),
+            Some("mixed-chat-responses")
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert!(models.is_empty(), "null + responses group is excluded");
+
+        // [null, "chat"] folds to plain chat — every member serves chat.
+        let entries = vec![
+            entry(
+                "unlabeled-plus-chat",
+                ModelInfo {
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "unlabeled-plus-chat",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().mode.as_deref(),
+            Some("chat")
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models.len(), 1);
+
+        // All-null stays null so the warning fires (no behavior change).
+        let entries = vec![
+            entry(
+                "fully-unlabeled",
+                ModelInfo {
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "fully-unlabeled",
+                ModelInfo {
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(merged[0].model_info.as_ref().unwrap().mode, None);
     }
 
     #[test]

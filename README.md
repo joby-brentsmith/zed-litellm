@@ -84,7 +84,10 @@ and duplicate deployments of the same `model_name` are merged into one conservat
 
 `interleaved_reasoning` defaults to `false` because LiteLLM's `/model/info`
 cannot report it. Pass `--probe` to send a minimal test request to each
-reasoning-capable model: it sets `interleaved_reasoning: true` only when the
+reasoning-capable model (the probe sends the exact `reasoning_effort` each
+generated entry will carry, and neither the probe nor `--check-liveness`
+touches models matched by `--exclude` — excluded backends are usually
+excluded because they are unreachable): it sets `interleaved_reasoning: true` only when the
 model both accepts `reasoning_content` in input *and* emits it in its own
 response — distinguishing real support from silent accept-and-ignore. The
 probe adds one near-zero-cost chat-completions call (`max_tokens: 1`) per
