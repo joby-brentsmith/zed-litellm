@@ -188,7 +188,12 @@ fn main() -> Result<()> {
 
     let interleaved = if probe {
         eprintln!("Probing reasoning models for interleaved_reasoning support...");
-        probe_interleaved_reasoning(&api_url, &entries, args.api_key.as_deref())
+        probe_interleaved_reasoning(
+            &api_url,
+            &entries,
+            &args.reasoning_effort,
+            args.api_key.as_deref(),
+        )
     } else {
         Vec::new()
     };
@@ -215,7 +220,7 @@ fn main() -> Result<()> {
         } else {
             ""
         };
-        if !args.replace && !existing_models(&settings_text, &args.provider).is_empty() {
+        if !replace && !existing_models(&settings_text, &args.provider).is_empty() {
             eprintln!(
                 "No chat models to sync from {base_url}/model/info{excluded_note}; preserving existing entries in {}",
                 args.settings.display()
@@ -335,8 +340,13 @@ fn fetch_model_info(base_url: &str, api_key: Option<&str>) -> Result<Vec<ModelEn
 ///   - token limits: min across the deployments that report them
 ///   - mode: the common mode when all entries agree; a mix that includes a
 ///     non-chat mode reports that non-chat mode (the group is excluded as
-///     non-chat downstream); a chat/responses mix reports "chat"
-///   - default_reasoning_effort: honored only when all deployments agree
+///     non-chat downstream); a chat/responses mix reports
+///     "mixed-chat-responses" and is excluded too (no single API serves
+///     every member of the group)
+///   - default_reasoning_effort: honored only when every deployment sets
+///     the same value; any disagreement or absence falls back to the CLI
+///     value (one backend's curated default is not stretched onto a
+///     sibling deployment across a failover hop)
 fn merge_deployments(entries: &[ModelEntry]) -> Vec<ModelEntry> {
     let mut by_name: std::collections::BTreeMap<String, Vec<&ModelEntry>> =
         std::collections::BTreeMap::new();
@@ -377,11 +387,15 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
     }
 
     fn agree(values: Vec<Option<String>>) -> Option<String> {
-        let known: Vec<String> = values.into_iter().flatten().collect();
-        let Some(first) = known.first() else {
+        // Unanimity requires completeness: an abstaining deployment (null)
+        // means the card default is NOT honored for the merged alias — the
+        // CLI fallback applies instead, so one backend's curated default is
+        // not stretched onto a sibling deployment across a failover hop.
+        let all: Vec<String> = values.into_iter().collect::<Option<Vec<_>>>()?;
+        let Some(first) = all.first() else {
             return None;
         };
-        known.iter().all(|v| v == first).then(|| first.clone())
+        all.iter().all(|v| v == first).then(|| first.clone())
     }
 
     let mode = {
@@ -402,8 +416,20 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
                 // A group mixing in a non-chat mode (e.g. embedding) is
                 // reported as non-chat so it's excluded downstream.
                 Some(non_chat) => Some(non_chat.to_string()),
-                // A chat/responses mix routes via chat.
-                None => Some("chat".to_string()),
+                // A chat/responses mix has no mode every member can serve:
+                // a Responses-only deployment fails /chat/completions, so
+                // the merged alias must not advertise chat (the AND-cap
+                // rule applied to the group end to end). Report a
+                // non-chat/responses mode so downstream excludes it.
+                None => {
+                    if let Some(name) = group.first().and_then(|e| e.model_name.clone()) {
+                        eprintln!(
+                            "warning: {name} mixes chat and Responses deployments; \
+                             excluded from the sync (no single API serves every member)"
+                        );
+                    }
+                    Some("mixed-chat-responses".to_string())
+                }
             },
         }
     };
@@ -456,23 +482,32 @@ fn merge_infos(group: &[&ModelEntry]) -> ModelInfo {
 fn probe_interleaved_reasoning(
     api_url: &str,
     entries: &[ModelEntry],
+    cli_reasoning_effort: &str,
     api_key: Option<&str>,
 ) -> Vec<String> {
     let mut supported = Vec::new();
-    let candidates: Vec<&str> = entries
+    let candidates: Vec<(&str, String)> = entries
         .iter()
         .filter_map(|entry| {
             let info = entry.model_info.as_ref()?;
             if info.supports_reasoning == Some(true) {
-                entry.model_name.as_deref()
+                // Probe the effort the sync will actually emit — the card
+                // default when set, else the CLI fallback — so a model that
+                // accepts the emitted tier but rejects `high` is not
+                // spuriously marked not-supporting (and vice versa).
+                let effort = info
+                    .default_reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| cli_reasoning_effort.to_string());
+                entry.model_name.as_deref().map(|n| (n, effort))
             } else {
                 None
             }
         })
         .collect();
 
-    for model_name in candidates {
-        match probe_one_model(api_url, model_name, api_key) {
+    for (model_name, effort) in candidates {
+        match probe_one_model(api_url, model_name, &effort, api_key) {
             Ok(true) => {
                 eprintln!("  {model_name}: interleaved_reasoning supported");
                 supported.push(model_name.to_string());
@@ -488,20 +523,23 @@ fn probe_interleaved_reasoning(
     supported
 }
 
-fn probe_one_model(api_url: &str, model_name: &str, api_key: Option<&str>) -> Result<bool> {
+fn probe_one_model(
+    api_url: &str,
+    model_name: &str,
+    reasoning_effort: &str,
+    api_key: Option<&str>,
+) -> Result<bool> {
     let url = format!("{api_url}/chat/completions");
-    // `reasoning_effort: "high"`: on the always-on GLM family reasoning
-    // fires regardless of effort strings; on qwen3.8 the card default is
-    // thinking-off, making the parameter inert. `high` is the faithful GLM
-    // tier — and what the deployed ladder hook translates `medium` into
-    // anyway (GLM groups; llaminar #114, GO 2026-10-13). `max_tokens: 1`
-    // keeps cost near zero, and on reasoning models the single completion
-    // token lands in reasoning_content (the signal we need) with no real
-    // output required.
+    // Probing the same `reasoning_effort` the generated entry will send: on
+    // the always-on GLM family reasoning fires regardless of effort
+    // strings; on qwen3.8 the card default is thinking-off, making the
+    // parameter inert. `max_tokens: 1` keeps cost near zero, and on
+    // reasoning models the single completion token lands in
+    // reasoning_content (the signal we need) with no real output required.
     let payload = json!({
         "model": model_name,
         "max_tokens": 1,
-        "reasoning_effort": "high",
+        "reasoning_effort": reasoning_effort,
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "reasoning_content": "prior thinking", "content": "ok"},
@@ -1150,6 +1188,96 @@ mod tests {
         );
         let models = to_zed_models(&merged, &[], "medium");
         assert_eq!(models[0]["reasoning_effort"], json!("medium"));
+    }
+
+    #[test]
+    fn merge_deployments_default_effort_needs_unanimity() {
+        // A deployment with no card default (null) is an abstention: the
+        // sibling's curated default must not be stretched onto it across
+        // the failover hop (regression for the Copilot PR-15 finding):
+        // [Some("low"), None] falls back to the CLI value.
+        let entries = vec![
+            entry(
+                "split-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    default_reasoning_effort: Some("low".to_string()),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "split-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0]
+                .model_info
+                .as_ref()
+                .unwrap()
+                .default_reasoning_effort,
+            None
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["reasoning_effort"], json!("high"));
+
+        // All deployments set the same default -> honored.
+        let entries = vec![
+            entry(
+                "same-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    default_reasoning_effort: Some("low".to_string()),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "same-effort",
+                ModelInfo {
+                    supports_reasoning: Some(true),
+                    default_reasoning_effort: Some("low".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        let models = to_zed_models(&merged, &[], "high");
+        assert_eq!(models[0]["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn merge_deployments_excludes_chat_responses_mixed_groups() {
+        // A Responses-only deployment cannot serve /chat/completions, so a
+        // mixed chat/responses alias must not be advertised as chat
+        // (regression for the Copilot PR-15 finding): the group is excluded
+        // from the sync instead.
+        let entries = vec![
+            entry(
+                "mixed-api",
+                ModelInfo {
+                    mode: Some("chat".to_string()),
+                    ..Default::default()
+                },
+            ),
+            entry(
+                "mixed-api",
+                ModelInfo {
+                    mode: Some("responses".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let merged = merge_deployments(&entries);
+        assert_eq!(
+            merged[0].model_info.as_ref().unwrap().mode.as_deref(),
+            Some("mixed-chat-responses")
+        );
+        let models = to_zed_models(&merged, &[], "high");
+        assert!(models.is_empty(), "mixed chat/responses group is excluded");
     }
 
     #[test]
